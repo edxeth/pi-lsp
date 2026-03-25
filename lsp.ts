@@ -28,7 +28,7 @@ function diagnosticsWaitMsForFile(filePath: string): number {
 }
 
 const DIAGNOSTICS_PREVIEW_LINES = 10;
-const LSP_IDLE_SHUTDOWN_MS = 2 * 60 * 1000;
+const LSP_IDLE_SHUTDOWN_MS = 60_000;
 const DIM = "\x1b[2m",
   GREEN = "\x1b[32m",
   YELLOW = "\x1b[33m",
@@ -36,17 +36,6 @@ const DIM = "\x1b[2m",
 const DEFAULT_HOOK_MODE: HookMode = "agent_end";
 const SETTINGS_NAMESPACE = "lsp";
 const LSP_CONFIG_ENTRY = "lsp-hook-config";
-
-const WARMUP_MAP: Record<string, string> = {
-  "pubspec.yaml": ".dart",
-  "package.json": ".ts",
-  "tsconfig.json": ".ts",
-  "jsconfig.json": ".js",
-  "pyproject.toml": ".py",
-  "go.work": ".go",
-  "go.mod": ".go",
-  "Cargo.toml": ".rs",
-};
 
 const MODE_LABELS: Record<HookMode, string> = {
   edit_write: "After each edit/write",
@@ -467,27 +456,6 @@ export default function (pi: ExtensionAPI) {
     restoreHookState(ctx);
     statusUpdateFn = ctx.hasUI && ctx.ui.setStatus ? ctx.ui.setStatus.bind(ctx.ui) : null;
     updateLspStatus();
-
-    if (hookMode === "disabled") return;
-
-    const manager = getOrCreateManager(ctx.cwd);
-
-    for (const [marker, ext] of Object.entries(WARMUP_MAP)) {
-      if (fs.existsSync(path.join(ctx.cwd, marker))) {
-        setActivity("loading");
-        manager
-          .getClientsForFile(path.join(ctx.cwd, `dummy${ext}`))
-          .then((clients) => {
-            if (clients.length > 0) {
-              const cfg = LSP_SERVERS.find((s) => s.extensions.includes(ext));
-              if (cfg) activeClients.add(cfg.id);
-            }
-          })
-          .catch(() => {})
-          .finally(() => setActivity("idle"));
-        break;
-      }
-    }
   });
 
   pi.on("session_switch", async (_event, ctx) => {
@@ -520,25 +488,13 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     const input = event.input && typeof event.input === "object" ? (event.input as Record<string, unknown>) : {};
 
-    if (event.toolName === "lsp") {
-      clearIdleShutdownTimer();
-      const files = extractLspFiles(input);
-      for (const file of files) {
-        ensureActiveClientForFile(file, ctx.cwd);
-      }
-      return;
-    }
-
-    if (event.toolName !== "read" && event.toolName !== "write" && event.toolName !== "edit") return;
+    if (event.toolName !== "lsp") return;
 
     clearIdleShutdownTimer();
-    const filePath = typeof input.path === "string" ? input.path : undefined;
-    if (!filePath) return;
-
-    const absPath = ensureActiveClientForFile(filePath, ctx.cwd);
-    if (!absPath) return;
-
-    void getOrCreateManager(ctx.cwd).getClientsForFile(absPath).catch(() => {});
+    const files = extractLspFiles(input);
+    for (const file of files) {
+      ensureActiveClientForFile(file, ctx.cwd);
+    }
   });
 
   pi.on("agent_start", async () => {
