@@ -29,10 +29,6 @@ function diagnosticsWaitMsForFile(filePath: string): number {
 
 const DIAGNOSTICS_PREVIEW_LINES = 10;
 const LSP_IDLE_SHUTDOWN_MS = 60_000;
-const DIM = "\x1b[2m",
-  GREEN = "\x1b[32m",
-  YELLOW = "\x1b[33m",
-  RESET = "\x1b[0m";
 const DEFAULT_HOOK_MODE: HookMode = "agent_end";
 const SETTINGS_NAMESPACE = "lsp";
 const LSP_CONFIG_ENTRY = "lsp-hook-config";
@@ -212,18 +208,17 @@ export default function (pi: ExtensionAPI) {
     if (!statusUpdateFn) return;
 
     const clients = activeClients.size > 0 ? [...activeClients].join(", ") : "";
-    const clientsText = clients ? `${DIM}${clients}${RESET}` : "";
-    const activityHint = activity === "idle" ? "" : `${DIM}•${RESET}`;
+    const activityHint = activity === "idle" ? "" : "•";
 
     if (hookMode === "disabled") {
-      const text = clientsText ? `${YELLOW}LSP${RESET} ${DIM}(tool)${RESET}: ${clientsText}` : `${YELLOW}LSP${RESET} ${DIM}(tool)${RESET}`;
+      const text = clients ? `LSP (tool): ${clients}` : "LSP (tool)";
       statusUpdateFn("lsp", text);
       return;
     }
 
-    let text = `${GREEN}LSP${RESET}`;
+    let text = "LSP";
     if (activityHint) text += ` ${activityHint}`;
-    if (clientsText) text += ` ${clientsText}`;
+    if (clients) text += ` ${clients}`;
     statusUpdateFn("lsp", text);
   }
 
