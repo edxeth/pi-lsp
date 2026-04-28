@@ -287,14 +287,16 @@ It does **not** automatically run diagnostics for unsupported files such as:
 - plain text
 - arbitrary config files with no registered LSP mapping
 
-So unsupported files do not get added to the LSP diagnostics summary and do not generate extra LSP context noise.
+It also stays quiet when a matching project root exists but the language-server binary is not installed. Use `/lsp-doctor <file>` if you want to inspect that state explicitly.
+
+So unsupported files and missing language-server binaries do not get added to the LSP diagnostics summary and do not generate extra LSP context noise.
 
 ### Agent-end mode
 
 In `At agent end` mode:
 
 - touched compatible files are collected during the response
-- diagnostics run once at the end
+- diagnostics run once after the final assistant turn for that response
 - the result is posted as a single diagnostics message
 
 This is usually the best default if you want less interruption.
@@ -304,6 +306,7 @@ This is usually the best default if you want less interruption.
 In `After each edit/write` mode:
 
 - diagnostics run immediately after each edit or write
+- diagnostics messages are styled by severity in the UI, with errors shown using the error color
 - results are appended sooner
 - this is more interactive but can be noisier
 
@@ -350,7 +353,7 @@ On session start, the extension can warm up an LSP client based on common root m
 ### Go
 
 - supports both `go.work` and `go.mod`
-- uses a slightly longer diagnostics wait window than the default to reduce false timeouts on cold starts
+- uses a longer diagnostics wait window than the default to reduce false timeouts on cold starts
 
 ### Rust
 

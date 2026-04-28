@@ -859,7 +859,6 @@ export class LSPManager {
         if (current && current.length > 0) {
           if (settleTimer) clearTimeout(settleTimer);
           settleTimer = setTimeout(() => finish(true), 1500);
-          (settleTimer as NodeJS.Timeout & { unref?: () => void }).unref?.();
           return;
         }
 
@@ -867,11 +866,9 @@ export class LSPManager {
 
         if (settleTimer) clearTimeout(settleTimer);
         settleTimer = setTimeout(() => finish(true), 2500);
-        (settleTimer as NodeJS.Timeout & { unref?: () => void }).unref?.();
       };
 
       const timer = setTimeout(() => finish(false), timeoutMs);
-      (timer as NodeJS.Timeout & { unref?: () => void }).unref?.();
 
       const listeners = client.listeners.get(absPath) || [];
       listeners.push(listener);

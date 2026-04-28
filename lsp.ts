@@ -22,7 +22,7 @@ const DIAGNOSTICS_WAIT_MS_DEFAULT = 3000;
 
 function diagnosticsWaitMsForFile(filePath: string): number {
   const ext = path.extname(filePath).toLowerCase();
-  if (ext === ".go") return 8000;
+  if (ext === ".go") return 20000;
   if (ext === ".rs") return 20000;
   return DIAGNOSTICS_WAIT_MS_DEFAULT;
 }
@@ -401,6 +401,12 @@ export default function (pi: ExtensionAPI) {
       await waitForReadableFile(absPath);
       const result = await manager.touchFileAndWait(absPath, diagnosticsWaitMsForFile(absPath));
       if (result.unsupported || result.error) {
+        const inspection = inspectLspForFile(diagnosticsCtx.cwd, absPath);
+        if (inspection.status === "missing-binary" || inspection.status === "unsupported") {
+          lastDiagnosticReports.delete(absPath);
+          return undefined;
+        }
+
         const relativePath = path.relative(diagnosticsCtx.cwd, absPath);
         const message = `File: ${relativePath}\nLSP unavailable: ${result.error || "No LSP response"}`;
         if (notify) diagnosticsCtx.notify(message, "warning");
@@ -440,7 +446,7 @@ export default function (pi: ExtensionAPI) {
       },
       {
         triggerTurn: true,
-        deliverAs: "followUp",
+        deliverAs: "steer",
       }
     );
   }
@@ -635,17 +641,24 @@ export default function (pi: ExtensionAPI) {
     bashReportedFiles.clear();
   });
 
-  function agentWasAborted(event: { messages?: Array<{ role?: string; stopReason?: string }> }): boolean {
-    const messages = Array.isArray(event?.messages) ? event.messages : [];
-    return messages.some((m) => m && typeof m === "object" && m.role === "assistant" && (m.stopReason === "aborted" || m.stopReason === "error"));
+  function assistantTurnShouldRunAgentEndDiagnostics(event: { message?: { role?: string; stopReason?: string } }): boolean {
+    const message = event.message;
+    if (!message || message.role !== "assistant") return false;
+    return message.stopReason !== "toolUse";
   }
 
-  pi.on("agent_end", async (event, ctx) => {
+  function assistantTurnWasAborted(event: { message?: { role?: string; stopReason?: string } }): boolean {
+    const message = event.message;
+    return !!message && message.role === "assistant" && (message.stopReason === "aborted" || message.stopReason === "error");
+  }
+
+  pi.on("turn_end", async (event, ctx) => {
     let diagnosticsCtx: DiagnosticsContext | undefined;
     try {
       if (hookMode !== "agent_end") return;
+      if (!assistantTurnShouldRunAgentEndDiagnostics(event)) return;
 
-      if (agentWasAborted(event)) {
+      if (assistantTurnWasAborted(event)) {
         touchedFiles.clear();
         return;
       }
@@ -723,6 +736,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const includeWarnings = event.toolName === "write";
-    scheduleEditWriteDiagnostics(absPath, diagnosticsCtx, includeWarnings);    return;
+    scheduleEditWriteDiagnostics(absPath, diagnosticsCtx, includeWarnings);
+    return;
   });
 }
