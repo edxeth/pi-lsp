@@ -13,7 +13,7 @@ import * as os from "node:os";
 import { type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { type Diagnostic } from "vscode-languageserver-protocol";
-import { LSP_SERVERS, formatDiagnostic, getOrCreateManager, inspectLspForFile, shutdownManager } from "./lsp-core.js";
+import { LSP_SERVERS, diagnosticSeverityLabel, formatDiagnostic, getOrCreateManager, inspectLspForFile, shutdownManager } from "./lsp-core.js";
 
 type HookScope = "session" | "global";
 type HookMode = "edit_write" | "agent_end" | "disabled";
@@ -50,6 +50,12 @@ interface HookConfigEntry {
   hookMode?: HookMode;
 }
 
+interface DiagnosticsContext {
+  cwd: string;
+  hasUI: boolean;
+  notify: (message: string, type?: "info" | "warning" | "error") => void;
+}
+
 export default function (pi: ExtensionAPI) {
   type LspActivity = "idle" | "loading" | "working";
 
@@ -63,21 +69,35 @@ export default function (pi: ExtensionAPI) {
   let idleShutdownTimer: NodeJS.Timeout | null = null;
 
   const touchedFiles: Map<string, boolean> = new Map();
+  const pendingBashFiles: Map<string, string[]> = new Map();
+  const scheduledDiagnostics: Map<string, NodeJS.Timeout> = new Map();
+  const lastDiagnosticReports: Map<string, string> = new Map();
+  const bashReportedFiles: Set<string> = new Set();
   const globalSettingsPath = path.join(os.homedir(), ".pi", "agent", "settings.json");
 
-  function readSettingsFile(filePath: string): Record<string, unknown> {
+  function readSettingsFile(filePath: string): { ok: true; settings: Record<string, unknown> } | { ok: false; error: string; missing?: boolean } {
     try {
-      if (!fs.existsSync(filePath)) return {};
+      if (!fs.existsSync(filePath)) return { ok: true, settings: {} };
       const raw = fs.readFileSync(filePath, "utf-8");
       const parsed = JSON.parse(raw);
-      return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
-    } catch {
-      return {};
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { ok: false, error: "Settings file must contain a JSON object." };
+      return { ok: true, settings: parsed as Record<string, unknown> };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   }
 
+  function writeJsonAtomic(filePath: string, value: unknown): void {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", "utf-8");
+    fs.renameSync(tmp, filePath);
+  }
+
   function getGlobalHookMode(): HookMode | undefined {
-    const settings = readSettingsFile(globalSettingsPath);
+    const read = readSettingsFile(globalSettingsPath);
+    if (!read.ok) return undefined;
+    const settings = read.settings;
     const lspSettings = settings[SETTINGS_NAMESPACE];
     const hookValue = (lspSettings as { hookMode?: unknown; hookEnabled?: unknown } | undefined)?.hookMode;
     const normalized = normalizeHookMode(hookValue);
@@ -88,19 +108,21 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   }
 
-  function setGlobalHookMode(mode: HookMode): boolean {
+  function setGlobalHookMode(mode: HookMode): { ok: true } | { ok: false; error: string } {
     try {
-      const settings = readSettingsFile(globalSettingsPath);
+      const read = readSettingsFile(globalSettingsPath);
+      if (!read.ok) return { ok: false, error: `Could not parse ${globalSettingsPath}: ${read.error}` };
+
+      const settings = read.settings;
       const existing = settings[SETTINGS_NAMESPACE];
       const nextNamespace =
-        existing && typeof existing === "object" ? { ...(existing as Record<string, unknown>), hookMode: mode } : { hookMode: mode };
+        existing && typeof existing === "object" && !Array.isArray(existing) ? { ...(existing as Record<string, unknown>), hookMode: mode } : { hookMode: mode };
 
       settings[SETTINGS_NAMESPACE] = nextNamespace;
-      fs.mkdirSync(path.dirname(globalSettingsPath), { recursive: true });
-      fs.writeFileSync(globalSettingsPath, JSON.stringify(settings, null, 2), "utf-8");
-      return true;
-    } catch {
-      return false;
+      writeJsonAtomic(globalSettingsPath, settings);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   }
 
@@ -165,10 +187,19 @@ export default function (pi: ExtensionAPI) {
 
   function formatDiagnosticsForDisplay(text: string): string {
     return text
+      .replace(/\n?This file has LSP (?:errors; please fix them|diagnostics; please review them)\n/gi, "\n")
       .replace(/\n?This file has errors, please fix\n/gi, "\n")
       .replace(/<\/?file_diagnostics>\n?/gi, "")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
+  }
+
+  function styleDiagnosticDisplayLine(line: string, theme: Parameters<NonNullable<Parameters<ExtensionAPI["registerMessageRenderer"]>[1]>>[2]): string {
+    if (line.startsWith("File: ")) return theme.fg("muted", line);
+    if (/^(ERROR|FATAL)\b/i.test(line) || /\bLSP errors?\b/i.test(line)) return theme.fg("error", line);
+    if (/^(WARN|WARNING)\b/i.test(line) || /\bLSP unavailable\b/i.test(line)) return theme.fg("warning", line);
+    if (/^(INFO|HINT)\b/i.test(line)) return theme.fg("muted", line);
+    return theme.fg("toolOutput", line);
   }
 
   function setActivity(next: LspActivity): void {
@@ -226,6 +257,13 @@ export default function (pi: ExtensionAPI) {
     return path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
   }
 
+  function snapshotDiagnosticsContext(ctx: ExtensionContext): DiagnosticsContext {
+    const cwd = ctx.cwd;
+    const hasUI = ctx.hasUI;
+    const notify = hasUI ? ctx.ui.notify.bind(ctx.ui) : (message: string) => console.error(message);
+    return { cwd, hasUI, notify };
+  }
+
   pi.registerMessageRenderer("lsp-diagnostics", (message, options, theme) => {
     const content = formatDiagnosticsForDisplay(messageContentToText(message.content));
     if (!content) return new Text("", 0, 0);
@@ -236,10 +274,7 @@ export default function (pi: ExtensionAPI) {
     const display = lines.slice(0, maxLines);
     const remaining = lines.length - display.length;
 
-    const styledLines = display.map((line) => {
-      if (line.startsWith("File: ")) return theme.fg("muted", line);
-      return theme.fg("toolOutput", line);
-    });
+    const styledLines = display.map((line) => styleDiagnosticDisplayLine(line, theme));
 
     if (!expanded && remaining > 0) {
       styledLines.push(theme.fg("dim", `... (${remaining} more lines)`));
@@ -293,6 +328,38 @@ export default function (pi: ExtensionAPI) {
     return files;
   }
 
+  function extractBashFileCandidates(command: string, cwd: string): string[] {
+    const candidates = new Set<string>();
+    const supported = new Set(LSP_SERVERS.flatMap((server) => server.extensions));
+    const pathLike = /(?:^|[\s'"`=:(>])((?:\.{1,2}\/|\/)?[A-Za-z0-9_@%+=:,./-]+\.[A-Za-z0-9]+)/g;
+    const changesDirectory = /(?:^|[;&|()\n])\s*cd\s+/.test(command);
+
+    for (const match of command.matchAll(pathLike)) {
+      const raw = match[1]?.replace(/[),;]+$/, "");
+      if (!raw) continue;
+      if (!supported.has(path.extname(raw))) continue;
+      if (changesDirectory && !path.isAbsolute(raw)) continue;
+      const abs = path.isAbsolute(raw) ? raw : path.resolve(cwd, raw);
+      const rel = path.relative(cwd, abs);
+      if (rel.startsWith("..") || path.isAbsolute(rel)) continue;
+      candidates.add(abs);
+      if (candidates.size >= 10) break;
+    }
+
+    return [...candidates];
+  }
+
+  async function waitForReadableFile(absPath: string, timeoutMs = 1500): Promise<boolean> {
+    const start = Date.now();
+    while (Date.now() - start <= timeoutMs) {
+      try {
+        if (fs.existsSync(absPath) && fs.statSync(absPath).isFile()) return true;
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return false;
+  }
+
   function buildDiagnosticsOutput(
     filePath: string,
     diagnostics: Diagnostic[],
@@ -305,7 +372,7 @@ export default function (pi: ExtensionAPI) {
 
     const MAX = 5;
     const lines = diagnostics.slice(0, MAX).map((e) => {
-      const sev = e.severity === 1 ? "ERROR" : "WARN";
+      const sev = diagnosticSeverityLabel(e.severity);
       return `${sev}[${e.range.start.line + 1}] ${e.message.split("\n")[0]}`;
     });
 
@@ -313,40 +380,98 @@ export default function (pi: ExtensionAPI) {
     if (diagnostics.length > MAX) notification += `\n... +${diagnostics.length - MAX} more`;
 
     const header = includeFileHeader ? `File: ${relativePath}\n` : "";
-    const output = `\n${header}This file has errors, please fix\n<file_diagnostics>\n${diagnostics.map(formatDiagnostic).join("\n")}\n</file_diagnostics>\n`;
+    const headline = errorCount > 0 ? "This file has LSP errors; please fix them" : "This file has LSP diagnostics; please review them";
+    const output = `\n${header}${headline}\n<file_diagnostics>\n${diagnostics.map(formatDiagnostic).join("\n")}\n</file_diagnostics>\n`;
 
     return { notification, errorCount, output };
   }
 
   async function collectDiagnostics(
     filePath: string,
-    ctx: ExtensionContext,
+    diagnosticsCtx: DiagnosticsContext,
     includeWarnings: boolean,
     includeFileHeader: boolean,
     notify = true
   ): Promise<string | undefined> {
-    const manager = getOrCreateManager(ctx.cwd);
-    const absPath = ensureActiveClientForFile(filePath, ctx.cwd);
+    const manager = getOrCreateManager(diagnosticsCtx.cwd);
+    const absPath = ensureActiveClientForFile(filePath, diagnosticsCtx.cwd);
     if (!absPath) return undefined;
 
     try {
+      await waitForReadableFile(absPath);
       const result = await manager.touchFileAndWait(absPath, diagnosticsWaitMsForFile(absPath));
+      if (result.unsupported || result.error) {
+        const relativePath = path.relative(diagnosticsCtx.cwd, absPath);
+        const message = `File: ${relativePath}\nLSP unavailable: ${result.error || "No LSP response"}`;
+        if (notify) diagnosticsCtx.notify(message, "warning");
+        const key = `unavailable:${message}`;
+        if (lastDiagnosticReports.get(absPath) === key) return undefined;
+        lastDiagnosticReports.set(absPath, key);
+        return `\n${message}\n`;
+      }
       if (!result.receivedResponse) return undefined;
 
       const diagnostics = includeWarnings ? result.diagnostics : result.diagnostics.filter((d) => d.severity === 1);
-      if (!diagnostics.length) return undefined;
-
-      const report = buildDiagnosticsOutput(filePath, diagnostics, ctx.cwd, includeFileHeader);
-
-      if (notify) {
-        if (ctx.hasUI) ctx.ui.notify(report.notification, report.errorCount > 0 ? "error" : "warning");
-        else console.error(report.notification);
+      if (!diagnostics.length) {
+        lastDiagnosticReports.delete(absPath);
+        return undefined;
       }
+
+      const diagnosticText = diagnostics.map(formatDiagnostic).join("\n");
+      if (lastDiagnosticReports.get(absPath) === diagnosticText) return undefined;
+      lastDiagnosticReports.set(absPath, diagnosticText);
+
+      const report = buildDiagnosticsOutput(filePath, diagnostics, diagnosticsCtx.cwd, includeFileHeader);
+
+      if (notify) diagnosticsCtx.notify(report.notification, report.errorCount > 0 ? "error" : "warning");
 
       return report.output;
     } catch {
       return undefined;
     }
+  }
+
+  function sendDiagnosticsMessage(output: string): void {
+    pi.sendMessage(
+      {
+        customType: "lsp-diagnostics",
+        content: output,
+        display: true,
+      },
+      {
+        triggerTurn: true,
+        deliverAs: "followUp",
+      }
+    );
+  }
+
+  function clearScheduledDiagnostics(): void {
+    for (const timer of scheduledDiagnostics.values()) clearTimeout(timer);
+    scheduledDiagnostics.clear();
+  }
+
+  function scheduleEditWriteDiagnostics(filePath: string, diagnosticsCtx: DiagnosticsContext, includeWarnings: boolean): void {
+    const absPath = normalizeFilePath(filePath, diagnosticsCtx.cwd);
+    const existing = scheduledDiagnostics.get(absPath);
+    if (existing) clearTimeout(existing);
+
+    setActivity("working");
+    const timer = setTimeout(() => {
+      scheduledDiagnostics.delete(absPath);
+      void (async () => {
+        try {
+          const output = await collectDiagnostics(absPath, diagnosticsCtx, includeWarnings, false);
+          if (output && !shuttingDown) sendDiagnosticsMessage(output);
+        } finally {
+          if (!shuttingDown && scheduledDiagnostics.size === 0) {
+            setActivity("idle");
+            if (diagnosticsCtx.hasUI) scheduleIdleShutdown();
+            else void shutdownLspServersForIdle();
+          }
+        }
+      })();
+    }, 750);
+    scheduledDiagnostics.set(absPath, timer);
   }
 
   pi.registerCommand("lsp-restart", {
@@ -432,8 +557,8 @@ export default function (pi: ExtensionAPI) {
       if (!scope) return;
       if (scope === "global") {
         const ok = setGlobalHookMode(nextMode);
-        if (!ok) {
-          ctx.ui.notify("Failed to update global settings", "error");
+        if (!ok.ok) {
+          ctx.ui.notify(`Failed to update global settings: ${ok.error}`, "error");
           return;
         }
       }
@@ -441,6 +566,10 @@ export default function (pi: ExtensionAPI) {
       hookMode = nextMode;
       hookScope = scope;
       touchedFiles.clear();
+      pendingBashFiles.clear();
+      clearScheduledDiagnostics();
+      lastDiagnosticReports.clear();
+      bashReportedFiles.clear();
       persistHookEntry({ scope, hookMode: nextMode });
       updateLspStatus();
       ctx.ui.notify(`LSP hook: ${labelForMode(hookMode)} (${hookScope})`, "info");
@@ -467,11 +596,23 @@ export default function (pi: ExtensionAPI) {
 
     await shutdownManager();
     activeClients.clear();
+    touchedFiles.clear();
+    pendingBashFiles.clear();
+    clearScheduledDiagnostics();
+    lastDiagnosticReports.clear();
+    bashReportedFiles.clear();
     statusUpdateFn?.("lsp", undefined);
   });
 
   pi.on("tool_call", async (event, ctx) => {
     const input = event.input && typeof event.input === "object" ? (event.input as Record<string, unknown>) : {};
+
+    if (event.toolName === "bash" && typeof input.command === "string") {
+      const id = (event as { toolCallId?: string }).toolCallId;
+      const files = extractBashFileCandidates(input.command, ctx.cwd);
+      if (id && files.length) pendingBashFiles.set(id, files);
+      return;
+    }
 
     if (event.toolName !== "lsp") return;
 
@@ -488,6 +629,10 @@ export default function (pi: ExtensionAPI) {
     diagnosticsAbort = null;
     setActivity("idle");
     touchedFiles.clear();
+    pendingBashFiles.clear();
+    clearScheduledDiagnostics();
+    lastDiagnosticReports.clear();
+    bashReportedFiles.clear();
   });
 
   function agentWasAborted(event: { messages?: Array<{ role?: string; stopReason?: string }> }): boolean {
@@ -496,6 +641,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("agent_end", async (event, ctx) => {
+    let diagnosticsCtx: DiagnosticsContext | undefined;
     try {
       if (hookMode !== "agent_end") return;
 
@@ -505,8 +651,9 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (touchedFiles.size === 0) return;
-      if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
+      if (ctx.hasPendingMessages()) return;
 
+      diagnosticsCtx = snapshotDiagnosticsContext(ctx);
       const abort = new AbortController();
       diagnosticsAbort?.abort();
       diagnosticsAbort = abort;
@@ -518,47 +665,52 @@ export default function (pi: ExtensionAPI) {
         const outputs: string[] = [];
         for (const [filePath, includeWarnings] of files) {
           if (shuttingDown || abort.signal.aborted) return;
-          if (!ctx.isIdle() || ctx.hasPendingMessages()) {
-            abort.abort();
-            return;
-          }
 
-          const output = await collectDiagnostics(filePath, ctx, includeWarnings, true, false);
+          const output = await collectDiagnostics(filePath, diagnosticsCtx, includeWarnings, true, false);
           if (abort.signal.aborted) return;
           if (output) outputs.push(output);
         }
 
         if (shuttingDown || abort.signal.aborted) return;
 
-        if (outputs.length) {
-          pi.sendMessage(
-            {
-              customType: "lsp-diagnostics",
-              content: outputs.join("\n"),
-              display: true,
-            },
-            {
-              triggerTurn: true,
-              deliverAs: "followUp",
-            }
-          );
-        }
+        if (outputs.length) sendDiagnosticsMessage(outputs.join("\n"));
       } finally {
         if (diagnosticsAbort === abort) diagnosticsAbort = null;
         if (!shuttingDown) setActivity("idle");
       }
     } finally {
-      if (!shuttingDown) scheduleIdleShutdown();
+      if (!shuttingDown && diagnosticsCtx) {
+        if (diagnosticsCtx.hasUI) scheduleIdleShutdown();
+        else await shutdownLspServersForIdle();
+      }
     }
   });
 
   pi.on("tool_result", async (event, ctx) => {
+    if (event.toolName === "bash") {
+      const id = (event as { toolCallId?: string }).toolCallId;
+      const files = id ? pendingBashFiles.get(id) : undefined;
+      if (id) pendingBashFiles.delete(id);
+      if (event.isError || hookMode === "disabled" || !files?.length) return;
+
+      const diagnosticsCtx = snapshotDiagnosticsContext(ctx);
+      for (const file of files) {
+        const absPath = normalizeFilePath(file, diagnosticsCtx.cwd);
+        if (bashReportedFiles.has(absPath)) continue;
+        bashReportedFiles.add(absPath);
+        scheduleEditWriteDiagnostics(absPath, diagnosticsCtx, true);
+      }
+      return;
+    }
+
     if (event.toolName !== "write" && event.toolName !== "edit") return;
+    if (event.isError) return;
 
     const filePath = event.input.path as string;
     if (!filePath) return;
 
-    const absPath = ensureActiveClientForFile(filePath, ctx.cwd);
+    const diagnosticsCtx = snapshotDiagnosticsContext(ctx);
+    const absPath = ensureActiveClientForFile(filePath, diagnosticsCtx.cwd);
     if (!absPath) return;
 
     if (hookMode === "disabled") return;
@@ -571,9 +723,6 @@ export default function (pi: ExtensionAPI) {
     }
 
     const includeWarnings = event.toolName === "write";
-    const output = await collectDiagnostics(absPath, ctx, includeWarnings, false);
-    if (!output) return;
-
-    return { content: [...event.content, { type: "text" as const, text: output }] as Array<{ type: "text"; text: string }> };
+    scheduleEditWriteDiagnostics(absPath, diagnosticsCtx, includeWarnings);    return;
   });
 }

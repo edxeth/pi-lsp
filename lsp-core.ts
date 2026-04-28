@@ -45,6 +45,8 @@ import {
 
 // Config
 const INIT_TIMEOUT_MS = 30000;
+const REQUEST_TIMEOUT_MS = 10000;
+const SHUTDOWN_TIMEOUT_MS = 1000;
 const MAX_OPEN_FILES = 30;
 const IDLE_TIMEOUT_MS = 60_000;
 const CLEANUP_INTERVAL_MS = 30_000;
@@ -82,7 +84,7 @@ export interface LspInspection {
   serverId?: string;
   root?: string;
   binary?: string;
-  status: "ok" | "unsupported" | "missing-binary";
+  status: "ok" | "unsupported" | "missing-binary" | "startup-failed";
   reason?: string;
 }
 
@@ -155,14 +157,22 @@ function normalizeFsPath(p: string): string {
   }
 }
 
+function isPathInsideOrEqual(child: string, parent: string): boolean {
+  const rel = path.relative(path.resolve(parent), path.resolve(child));
+  return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
 function findNearestFile(startDir: string, targets: string[], stopDir: string): string | undefined {
   let current = path.resolve(startDir);
   const stop = path.resolve(stopDir);
-  while (current.length >= stop.length) {
+  if (!isPathInsideOrEqual(current, stop)) return undefined;
+
+  while (isPathInsideOrEqual(current, stop)) {
     for (const t of targets) {
       const candidate = path.join(current, t);
       if (fs.existsSync(candidate)) return candidate;
     }
+    if (current === stop) break;
     const parent = path.dirname(current);
     if (parent === current) break;
     current = parent;
@@ -413,40 +423,54 @@ export const LSP_SERVERS: LSPServerConfig[] = [
   },
 ];
 
-// Singleton Manager
-let sharedManager: LSPManager | null = null;
-let managerCwd: string | null = null;
+// Manager registry. Keep managers scoped by cwd so two sessions in one process do not
+// accidentally tear down each other's language servers.
+const managers = new Map<string, LSPManager>();
+
+function managerKey(cwd: string): string {
+  return normalizeFsPath(path.resolve(cwd));
+}
 
 export function getOrCreateManager(cwd: string): LSPManager {
-  if (!sharedManager || managerCwd !== cwd) {
-    sharedManager?.shutdown().catch(() => {});
-    sharedManager = new LSPManager(cwd);
-    managerCwd = cwd;
+  const key = managerKey(cwd);
+  const existing = managers.get(key);
+  if (existing) return existing;
+
+  const manager = new LSPManager(key);
+  managers.set(key, manager);
+  return manager;
+}
+
+export function getManager(cwd?: string): LSPManager | null {
+  if (cwd) return managers.get(managerKey(cwd)) ?? null;
+  return managers.values().next().value ?? null;
+}
+
+export async function shutdownManager(cwd?: string): Promise<void> {
+  if (cwd) {
+    const key = managerKey(cwd);
+    const manager = managers.get(key);
+    if (!manager) return;
+    managers.delete(key);
+    await manager.shutdown();
+    return;
   }
-  return sharedManager;
-}
 
-export function getManager(): LSPManager | null {
-  return sharedManager;
-}
-
-export async function shutdownManager(): Promise<void> {
-  const manager = sharedManager;
-  if (!manager) return;
-
-  sharedManager = null;
-  managerCwd = null;
-
-  await manager.shutdown();
+  const all = Array.from(managers.values());
+  managers.clear();
+  await Promise.all(all.map((manager) => manager.shutdown()));
 }
 
 // LSP Manager
 export class LSPManager {
   private clients = new Map<string, LSPClient>();
   private spawning = new Map<string, Promise<LSPClient | undefined>>();
+  private startingProcesses = new Set<ChildProcessWithoutNullStreams>();
   private broken = new Set<string>();
+  private lastFailures = new Map<string, string>();
   private cwd: string;
   private cleanupTimer: NodeJS.Timeout | null = null;
+  private closed = false;
 
   constructor(cwd: string) {
     this.cwd = cwd;
@@ -489,12 +513,54 @@ export class LSPManager {
     return `${id}:${root}`;
   }
 
+  private recordFailure(key: string, message: string, stderr?: string[]): void {
+    const stderrTail = stderr?.length ? `\nstderr:\n${stderr.slice(-20).join("\n")}` : "";
+    this.lastFailures.set(key, `${message}${stderrTail}`);
+    this.broken.add(key);
+  }
+
+  private clearFailure(key: string): void {
+    this.lastFailures.delete(key);
+    this.broken.delete(key);
+  }
+
+  private async lspRequest<T>(client: LSPClient, request: unknown, params: unknown, name: string, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
+    return timeout(client.connection.sendRequest(request as never, params as never) as Promise<T>, timeoutMs, name);
+  }
+
+  describeUnavailableForFile(filePath: string): string | undefined {
+    const ext = path.extname(filePath);
+    const absPath = this.resolve(filePath);
+
+    for (const config of LSP_SERVERS) {
+      if (!config.extensions.includes(ext)) continue;
+      const root = config.findRoot(absPath, this.cwd);
+      if (!root) return this.explainNoLsp(absPath);
+
+      const k = this.key(config.id, root);
+      return this.lastFailures.get(k) || (this.broken.has(k) ? `${config.id} language server is unavailable for ${root}` : undefined);
+    }
+
+    return this.explainNoLsp(absPath);
+  }
+
   private async initClient(config: LSPServerConfig, root: string): Promise<LSPClient | undefined> {
     const k = this.key(config.id, root);
+    let processHandle: ChildProcessWithoutNullStreams | undefined;
+    let stderr: string[] = [];
     try {
+      if (this.closed) return undefined;
       const handle = await config.spawn(root);
       if (!handle) {
-        this.broken.add(k);
+        this.recordFailure(k, `Project root detected, but no ${config.id} language-server binary was found or it exited immediately.`);
+        return undefined;
+      }
+      processHandle = handle.process;
+      this.startingProcesses.add(processHandle);
+      if (this.closed) {
+        try {
+          processHandle.kill();
+        } catch {}
         return undefined;
       }
 
@@ -505,7 +571,7 @@ export class LSPManager {
       handle.process.stdin?.on("error", () => {});
       handle.process.stdout?.on("error", () => {});
 
-      const stderr: string[] = [];
+      stderr = [];
       const MAX_STDERR_LINES = 200;
       handle.process.stderr?.on("data", (chunk: Buffer) => {
         try {
@@ -530,9 +596,11 @@ export class LSPManager {
         closed: false,
       };
 
-      conn.onNotification("textDocument/publishDiagnostics", (params: { uri: string; diagnostics: Diagnostic[] }) => {
-        const fpRaw = decodeURIComponent(new URL(params.uri).pathname);
+      conn.onNotification("textDocument/publishDiagnostics", (params: { uri: string; diagnostics: Diagnostic[]; version?: number }) => {
+        const fpRaw = uriToPath(params.uri);
         const fp = normalizeFsPath(fpRaw);
+        const currentVersion = client.openFiles.get(fp)?.version ?? client.openFiles.get(fpRaw)?.version;
+        if (typeof params.version === "number" && typeof currentVersion === "number" && params.version < currentVersion) return;
 
         client.diagnostics.set(fp, params.diagnostics);
 
@@ -602,10 +670,28 @@ export class LSPManager {
       if (handle.initOptions) {
         conn.sendNotification("workspace/didChangeConfiguration", { settings: handle.initOptions });
       }
+      if (this.closed) {
+        client.closed = true;
+        try {
+          client.connection.end();
+        } catch {}
+        try {
+          client.process.kill();
+        } catch {}
+        return undefined;
+      }
+      this.clearFailure(k);
       return client;
-    } catch {
-      this.broken.add(k);
+    } catch (e) {
+      if (processHandle) {
+        try {
+          processHandle.kill();
+        } catch {}
+      }
+      this.recordFailure(k, e instanceof Error ? e.message : String(e), stderr);
       return undefined;
+    } finally {
+      if (processHandle) this.startingProcesses.delete(processHandle);
     }
   }
 
@@ -770,7 +856,12 @@ export class LSPManager {
         if (resolved) return;
 
         const current = client.diagnostics.get(absPath);
-        if (current && current.length > 0) return finish(true);
+        if (current && current.length > 0) {
+          if (settleTimer) clearTimeout(settleTimer);
+          settleTimer = setTimeout(() => finish(true), 1500);
+          (settleTimer as NodeJS.Timeout & { unref?: () => void }).unref?.();
+          return;
+        }
 
         if (!isNew) return finish(true);
 
@@ -796,9 +887,9 @@ export class LSPManager {
     }
 
     try {
-      const res = (await client.connection.sendRequest(DocumentDiagnosticRequest.method, {
+      const res = (await this.lspRequest(client, DocumentDiagnosticRequest.method, {
         textDocument: { uri },
-      })) as { kind?: string; items?: Diagnostic[] };
+      }, "document diagnostics")) as { kind?: string; items?: Diagnostic[] };
 
       if (res?.kind === DocumentDiagnosticReportKind.Full) {
         return { diagnostics: Array.isArray(res.items) ? res.items : [], responded: true };
@@ -813,9 +904,9 @@ export class LSPManager {
     } catch {}
 
     try {
-      const res = (await client.connection.sendRequest(WorkspaceDiagnosticRequest.method, {
+      const res = (await this.lspRequest(client, WorkspaceDiagnosticRequest.method, {
         previousResultIds: [],
-      })) as { items?: Array<{ uri?: string; kind?: string; items?: Diagnostic[] }> };
+      }, "workspace diagnostics")) as { items?: Array<{ uri?: string; kind?: string; items?: Diagnostic[] }> };
 
       const items = res?.items || [];
       const match = items.find((it) => it?.uri === uri);
@@ -840,7 +931,7 @@ export class LSPManager {
 
     const clients = await this.getClientsForFile(absPath);
     if (!clients.length) {
-      return { diagnostics: [], receivedResponse: false, unsupported: true, error: this.explainNoLsp(absPath) };
+      return { diagnostics: [], receivedResponse: false, unsupported: true, error: this.describeUnavailableForFile(absPath) ?? this.explainNoLsp(absPath) };
     }
 
     const content = this.readFile(absPath);
@@ -851,30 +942,32 @@ export class LSPManager {
     const uri = pathToFileURL(absPath).href;
     const langId = this.langId(absPath);
     const isNew = clients.some((c) => !c.openFiles.has(absPath));
+    for (const c of clients) c.diagnostics.delete(absPath);
 
     const waits = clients.map((c) => this.waitForDiagnostics(c, absPath, timeoutMs, isNew));
     await this.openOrUpdate(clients, absPath, uri, langId, content);
     const results = await Promise.all(waits);
 
     let responded = results.some((r) => r);
-    const diags: Diagnostic[] = [];
+    let diags: Diagnostic[] = [];
     for (const c of clients) {
       const d = c.diagnostics.get(absPath);
       if (d) diags.push(...d);
     }
     if (!responded && clients.some((c) => c.diagnostics.has(absPath))) responded = true;
 
-    if (!responded || diags.length === 0) {
-      const pulled = await Promise.all(clients.map((c) => this.pullDiagnostics(c, absPath, uri)));
-      for (let i = 0; i < clients.length; i++) {
-        const r = pulled[i];
-        if (r.responded) responded = true;
-        if (r.diagnostics.length) {
-          clients[i].diagnostics.set(absPath, r.diagnostics);
-          diags.push(...r.diagnostics);
-        }
-      }
+    const pulled = await Promise.all(clients.map((c) => this.pullDiagnostics(c, absPath, uri)));
+    const pulledDiags: Diagnostic[] = [];
+    let pulledResponded = false;
+    for (let i = 0; i < clients.length; i++) {
+      const r = pulled[i];
+      if (!r.responded) continue;
+      pulledResponded = true;
+      responded = true;
+      clients[i].diagnostics.set(absPath, r.diagnostics);
+      pulledDiags.push(...r.diagnostics);
     }
+    if (pulledResponded) diags = pulledDiags;
 
     return { diagnostics: diags, receivedResponse: responded };
   }
@@ -899,12 +992,12 @@ export class LSPManager {
       }
 
       if (!clients.length) {
-        results.push({ file: absPath, diagnostics: [], status: "unsupported", error: this.explainNoLsp(absPath) });
+        results.push({ file: absPath, diagnostics: [], status: "unsupported", error: this.describeUnavailableForFile(absPath) ?? this.explainNoLsp(absPath) });
         continue;
       }
 
       const content = this.readFile(absPath);
-      if (!content) {
+      if (content === null) {
         results.push({ file: absPath, diagnostics: [], status: "error", error: "Could not read file" });
         continue;
       }
@@ -912,6 +1005,7 @@ export class LSPManager {
       const uri = pathToFileURL(absPath).href;
       const langId = this.langId(absPath);
       const isNew = clients.some((c) => !c.openFiles.has(absPath));
+      for (const c of clients) c.diagnostics.delete(absPath);
 
       for (const c of clients) {
         if (!c.openFiles.has(absPath)) {
@@ -924,7 +1018,7 @@ export class LSPManager {
       await this.openOrUpdate(clients, absPath, uri, langId, content, false);
       const waitResults = await Promise.all(waits);
 
-      const diags: Diagnostic[] = [];
+      let diags: Diagnostic[] = [];
       for (const c of clients) {
         const d = c.diagnostics.get(absPath);
         if (d) diags.push(...d);
@@ -932,17 +1026,18 @@ export class LSPManager {
 
       let responded = waitResults.some((r) => r) || diags.length > 0;
 
-      if (!responded || diags.length === 0) {
-        const pulled = await Promise.all(clients.map((c) => this.pullDiagnostics(c, absPath, uri)));
-        for (let i = 0; i < clients.length; i++) {
-          const r = pulled[i];
-          if (r.responded) responded = true;
-          if (r.diagnostics.length) {
-            clients[i].diagnostics.set(absPath, r.diagnostics);
-            diags.push(...r.diagnostics);
-          }
-        }
+      const pulled = await Promise.all(clients.map((c) => this.pullDiagnostics(c, absPath, uri)));
+      const pulledDiags: Diagnostic[] = [];
+      let pulledResponded = false;
+      for (let i = 0; i < clients.length; i++) {
+        const r = pulled[i];
+        if (!r.responded) continue;
+        pulledResponded = true;
+        responded = true;
+        clients[i].diagnostics.set(absPath, r.diagnostics);
+        pulledDiags.push(...r.diagnostics);
       }
+      if (pulledResponded) diags = pulledDiags;
 
       if (!responded && !diags.length) {
         results.push({ file: absPath, diagnostics: [], status: "timeout", error: "LSP did not respond" });
@@ -970,7 +1065,7 @@ export class LSPManager {
       l.clients.map(async (c) => {
         if (c.closed) return [];
         try {
-          return this.normalizeLocs(await c.connection.sendRequest(DefinitionRequest.type, { textDocument: { uri: l.uri }, position: pos }));
+          return this.normalizeLocs(await this.lspRequest(c, DefinitionRequest.type, { textDocument: { uri: l.uri }, position: pos }, "definition"));
         } catch {
           return [];
         }
@@ -988,7 +1083,7 @@ export class LSPManager {
       l.clients.map(async (c) => {
         if (c.closed) return [];
         try {
-          return this.normalizeLocs(await c.connection.sendRequest(ReferencesRequest.type, { textDocument: { uri: l.uri }, position: pos, context: { includeDeclaration: true } }));
+          return this.normalizeLocs(await this.lspRequest(c, ReferencesRequest.type, { textDocument: { uri: l.uri }, position: pos, context: { includeDeclaration: true } }, "references"));
         } catch {
           return [];
         }
@@ -1005,7 +1100,7 @@ export class LSPManager {
     for (const c of l.clients) {
       if (c.closed) continue;
       try {
-        const r = await c.connection.sendRequest(HoverRequest.type, { textDocument: { uri: l.uri }, position: pos });
+        const r = await this.lspRequest<Hover | null>(c, HoverRequest.type, { textDocument: { uri: l.uri }, position: pos }, "hover");
         if (r) return r;
       } catch {}
     }
@@ -1020,7 +1115,7 @@ export class LSPManager {
     for (const c of l.clients) {
       if (c.closed) continue;
       try {
-        const r = await c.connection.sendRequest(SignatureHelpRequest.type, { textDocument: { uri: l.uri }, position: pos });
+        const r = await this.lspRequest<SignatureHelp | null>(c, SignatureHelpRequest.type, { textDocument: { uri: l.uri }, position: pos }, "signature help");
         if (r) return r;
       } catch {}
     }
@@ -1035,7 +1130,7 @@ export class LSPManager {
       l.clients.map(async (c) => {
         if (c.closed) return [];
         try {
-          return this.normalizeSymbols(await c.connection.sendRequest(DocumentSymbolRequest.type, { textDocument: { uri: l.uri } }));
+          return this.normalizeSymbols(await this.lspRequest(c, DocumentSymbolRequest.type, { textDocument: { uri: l.uri } }, "document symbols"));
         } catch {
           return [];
         }
@@ -1052,11 +1147,11 @@ export class LSPManager {
     for (const c of l.clients) {
       if (c.closed) continue;
       try {
-        const r = await c.connection.sendRequest(RenameRequest.type, {
+        const r = await this.lspRequest<WorkspaceEdit | null>(c, RenameRequest.type, {
           textDocument: { uri: l.uri },
           position: pos,
           newName,
-        });
+        }, "rename");
         if (r) return r;
       } catch {}
     }
@@ -1084,11 +1179,11 @@ export class LSPManager {
       l.clients.map(async (c) => {
         if (c.closed) return [];
         try {
-          const r = await c.connection.sendRequest(CodeActionRequest.type, {
+          const r = await this.lspRequest<(CodeAction | Command)[] | null>(c, CodeActionRequest.type, {
             textDocument: { uri: l.uri },
             range,
             context: { diagnostics, only: [CodeActionKind.QuickFix, CodeActionKind.Refactor, CodeActionKind.Source] },
-          });
+          }, "code actions");
           return r || [];
         } catch {
           return [];
@@ -1109,10 +1204,21 @@ export class LSPManager {
   }
 
   async shutdown() {
+    if (this.closed) return;
+    this.closed = true;
     if (this.cleanupTimer) {
       clearInterval(this.cleanupTimer);
       this.cleanupTimer = null;
     }
+
+    for (const proc of Array.from(this.startingProcesses)) {
+      try {
+        proc.kill();
+      } catch {}
+    }
+    this.startingProcesses.clear();
+    this.spawning.clear();
+
     const clients = Array.from(this.clients.values());
     this.clients.clear();
     for (const c of clients) {
@@ -1120,7 +1226,7 @@ export class LSPManager {
       c.closed = true;
       if (!wasClosed) {
         try {
-          await Promise.race([c.connection.sendRequest("shutdown"), new Promise((r) => setTimeout(r, 1000))]);
+          await Promise.race([c.connection.sendRequest("shutdown"), new Promise((r) => setTimeout(r, SHUTDOWN_TIMEOUT_MS))]);
         } catch {}
         try {
           void c.connection.sendNotification("exit").catch(() => {});
@@ -1140,15 +1246,19 @@ export class LSPManager {
 export { DiagnosticSeverity };
 export type SeverityFilter = "all" | "error" | "warning" | "info" | "hint";
 
+export function diagnosticSeverityLabel(severity: Diagnostic["severity"]): string {
+  return severity === 1 ? "ERROR" : severity === 2 ? "WARN" : severity === 3 ? "INFO" : severity === 4 ? "HINT" : "DIAG";
+}
+
 export function formatDiagnostic(d: Diagnostic): string {
-  const sev = ["", "ERROR", "WARN", "INFO", "HINT"][d.severity || 1];
+  const sev = diagnosticSeverityLabel(d.severity);
   return `${sev} [${d.range.start.line + 1}:${d.range.start.character + 1}] ${d.message}`;
 }
 
 export function filterDiagnosticsBySeverity(diags: Diagnostic[], filter: SeverityFilter): Diagnostic[] {
   if (filter === "all") return diags;
   const max = { error: 1, warning: 2, info: 3, hint: 4 }[filter];
-  return diags.filter((d) => (d.severity || 1) <= max);
+  return diags.filter((d) => typeof d.severity === "number" && d.severity <= max);
 }
 
 // URI utilities

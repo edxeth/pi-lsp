@@ -17,7 +17,7 @@
  */
 
 import * as path from "node:path";
-import { Type, type Static } from "@sinclair/typebox";
+import { Type, type Static } from "typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
@@ -224,14 +224,16 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "lsp",
     label: "LSP",
-    description: `Query language server for definitions, references, types, symbols, diagnostics, rename, and code actions.
+    description: `Query language server for definitions, references, types, symbols, diagnostics, rename previews, and code-action previews.
 
-Actions: definition, references, hover, signature, rename (require file + line/column or query), symbols (file, optional query), diagnostics (file), workspace-diagnostics (files array), codeAction (file + position), restart (no args - restarts all LSP servers).
-Use bash to find files: find src -name "*.ts" -type f`,
+Actions: definition, references, hover, signature, rename (preview only; require file + line/column or query), symbols (file, optional query), diagnostics (file), workspace-diagnostics (files array), codeAction (preview/list only; file + position), restart (no args - restarts all LSP servers).
+Use find/grep or bash to locate files before querying LSP positions.`,
+    promptSnippet:
+      "lsp: Query language servers for definitions, references, hover, signature, symbols, diagnostics, rename previews, code-action previews, and restart.",
     parameters: LspParams,
 
-    async execute(_toolCallId, params, onUpdateArg, ctxArg, signalArg) {
-      const { signal, ctx } = normalizeExecuteArgs(onUpdateArg, ctxArg, signalArg);
+    async execute(_toolCallId, params, signalArg, onUpdateArg, ctxArg) {
+      const { signal, ctx } = normalizeExecuteArgs(signalArg, onUpdateArg, ctxArg);
       if (signal?.aborted) return cancelledToolResult();
       const manager = getOrCreateManager(ctx.cwd);
       const { action, file, files, line, column, endLine, endColumn, query, newName, severity } = params as LspParamsType;
@@ -265,23 +267,28 @@ Use bash to find files: find src -name "*.ts" -type f`,
           case "definition": {
             const results = await abortable(manager.getDefinition(file!, rLine!, rCol!), signal);
             const locs = results.map((l) => formatLocation(l, ctx?.cwd));
-            const payload = locs.length ? locs.join("\n") : fromQuery ? `${file}:${rLine}:${rCol}` : "No definitions found.";
+            const unavailable = !locs.length ? manager.describeUnavailableForFile(file!) : undefined;
+            const payload = locs.length ? locs.join("\n") : unavailable ? `LSP unavailable: ${unavailable}` : fromQuery ? `${file}:${rLine}:${rCol}` : "No definitions found.";
             return { content: [{ type: "text", text: `action: definition\n${qLine}${posLine}${payload}` }], details: results };
           }
           case "references": {
             const results = await abortable(manager.getReferences(file!, rLine!, rCol!), signal);
             const locs = results.map((l) => formatLocation(l, ctx?.cwd));
-            return { content: [{ type: "text", text: `action: references\n${qLine}${posLine}${locs.length ? locs.join("\n") : "No references found."}` }], details: results };
+            const unavailable = !locs.length ? manager.describeUnavailableForFile(file!) : undefined;
+            const payload = locs.length ? locs.join("\n") : unavailable ? `LSP unavailable: ${unavailable}` : "No references found.";
+            return { content: [{ type: "text", text: `action: references\n${qLine}${posLine}${payload}` }], details: results };
           }
           case "hover": {
             const result = await abortable(manager.getHover(file!, rLine!, rCol!), signal);
-            const payload = result ? formatHover(result.contents) || "No hover information." : "No hover information.";
+            const unavailable = !result ? manager.describeUnavailableForFile(file!) : undefined;
+            const payload = result ? formatHover(result.contents) || "No hover information." : unavailable ? `LSP unavailable: ${unavailable}` : "No hover information.";
             return { content: [{ type: "text", text: `action: hover\n${qLine}${posLine}${payload}` }], details: result ?? null };
           }
           case "symbols": {
             const symbols = await abortable(manager.getDocumentSymbols(file!), signal);
             const lines = collectSymbols(symbols, 0, [], query);
-            const payload = lines.length ? lines.join("\n") : query ? `No symbols matching "${query}".` : "No symbols found.";
+            const unavailable = !lines.length ? manager.describeUnavailableForFile(file!) : undefined;
+            const payload = lines.length ? lines.join("\n") : unavailable ? `LSP unavailable: ${unavailable}` : query ? `No symbols matching "${query}".` : "No symbols found.";
             return { content: [{ type: "text", text: `action: symbols\n${qLine}${payload}` }], details: symbols };
           }
           case "diagnostics": {
@@ -328,19 +335,21 @@ Use bash to find files: find src -name "*.ts" -type f`,
           }
           case "signature": {
             const result = await abortable(manager.getSignatureHelp(file!, rLine!, rCol!), signal);
-            return { content: [{ type: "text", text: `action: signature\n${qLine}${posLine}${formatSignature(result)}` }], details: result ?? null };
+            const unavailable = !result ? manager.describeUnavailableForFile(file!) : undefined;
+            const payload = unavailable ? `LSP unavailable: ${unavailable}` : formatSignature(result);
+            return { content: [{ type: "text", text: `action: signature\n${qLine}${posLine}${payload}` }], details: result ?? null };
           }
           case "rename": {
             if (!newName) throw new Error('Action "rename" requires a "newName" parameter.');
             const result = await abortable(manager.rename(file!, rLine!, rCol!, newName), signal);
             if (!result) return { content: [{ type: "text", text: `action: rename\n${qLine}${posLine}No rename available at this position.` }], details: null };
             const edits = formatWorkspaceEdit(result, ctx?.cwd);
-            return { content: [{ type: "text", text: `action: rename\n${qLine}${posLine}newName: ${newName}\n\n${edits}` }], details: result };
+            return { content: [{ type: "text", text: `action: rename\n${qLine}${posLine}mode: preview-only\nnewName: ${newName}\n\n${edits}` }], details: result };
           }
           case "codeAction": {
             const result = await abortable(manager.getCodeActions(file!, rLine!, rCol!, endLine, endColumn), signal);
             const actions = formatCodeActions(result);
-            return { content: [{ type: "text", text: `action: codeAction\n${qLine}${posLine}${actions.length ? actions.join("\n") : "No code actions available."}` }], details: result };
+            return { content: [{ type: "text", text: `action: codeAction\n${qLine}${posLine}mode: preview-only\n${actions.length ? actions.join("\n") : "No code actions available."}` }], details: result };
           }
           case "restart": {
             await shutdownManager();

@@ -241,8 +241,8 @@ Supported actions:
 - `diagnostics`
 - `workspace-diagnostics`
 - `signature`
-- `rename`
-- `codeAction`
+- `rename` (preview only; returns a workspace edit)
+- `codeAction` (preview/list only)
 - `restart`
 
 ### Parameters
@@ -272,11 +272,12 @@ The auto hook is designed to avoid bloating context unnecessarily.
 
 ### What it tracks
 
-It only tracks files from supported LSP-backed extensions that were touched by:
+It tracks files from supported LSP-backed extensions that were touched by:
 
 - `edit`
 - `write`
 - manual `lsp` interactions
+- best-effort `bash` command path detection for commands that mention supported source files
 
 ### What it skips
 
@@ -414,6 +415,8 @@ Use lsp action=workspace-diagnostics files=["src/a.ts","src/b.ts"] severity=warn
 - Deno projects are intentionally skipped by the JS/TS LSP integration
 - a recognized project root is required before a server will start
 - the language-server binary still has to be installed somewhere discoverable
+- `rename` and `codeAction` currently preview edits/actions; they do not apply changes
+- bash auto-detection is best-effort and only runs when a supported source path is visible in the command text
 
 ## Summary
 
