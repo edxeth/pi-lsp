@@ -285,11 +285,11 @@ bun run check
 For live extension checks, load this package explicitly:
 
 ```bash
-tia pi --no-extensions -e ./src/index.ts --no-session
+pi --no-extensions -e ./src/index.ts --no-session
 ```
 
 Use a temporary cache when testing installs:
 
 ```bash
-PI_LSP_CACHE_DIR=/tmp/pi-lsp-test-cache tia pi --no-extensions -e ./src/index.ts --no-session
+PI_LSP_CACHE_DIR=/tmp/pi-lsp-test-cache pi --no-extensions -e ./src/index.ts --no-session
 ```

@@ -72,6 +72,7 @@ export default function (pi: ExtensionAPI) {
 
   let activeClients: Set<string> = new Set();
   let statusUpdateFn: ((key: string, text: string | undefined) => void) | null = null;
+  let statusVisible = false;
   let hookMode: HookMode = DEFAULT_HOOK_MODE;
   let hookScope: HookScope = "global";
   let activity: LspActivity = "idle";
@@ -252,18 +253,20 @@ export default function (pi: ExtensionAPI) {
     if (!statusUpdateFn) return;
 
     const clients = activeClients.size > 0 ? [...activeClients].join(", ") : "";
-    const activityHint = activity === "idle" ? "" : "•";
-
-    if (hookMode === "disabled") {
-      const text = clients ? `LSP (tool): ${clients}` : "LSP (tool)";
-      statusUpdateFn("lsp", text);
+    if (!clients) {
+      if (statusVisible) {
+        statusUpdateFn("lsp", undefined);
+        statusVisible = false;
+      }
       return;
     }
 
-    let text = "LSP";
-    if (activityHint) text += ` ${activityHint}`;
-    if (clients) text += ` ${clients}`;
+    const activityHint = activity === "idle" ? "" : "•";
+    let text = hookMode === "disabled" ? `LSP (tool): ${clients}` : "LSP";
+    if (hookMode !== "disabled" && activityHint) text += ` ${activityHint}`;
+    if (hookMode !== "disabled") text += ` ${clients}`;
     statusUpdateFn("lsp", text);
+    statusVisible = true;
   }
 
   function normalizeFilePath(filePath: string, cwd: string): string {
@@ -309,18 +312,13 @@ export default function (pi: ExtensionAPI) {
     return boxedMessage([theme.fg("muted", "LSP doctor"), ...styledLines].join("\n"), theme);
   });
 
-  function getServerConfig(filePath: string) {
-    const ext = path.extname(filePath);
-    return LSP_SERVERS.find((s) => s.extensions.includes(ext));
-  }
-
   function ensureActiveClientForFile(filePath: string, cwd: string): string | undefined {
     const absPath = normalizeFilePath(filePath, cwd);
-    const cfg = getServerConfig(absPath);
-    if (!cfg) return undefined;
+    const info = inspectLspForFile(cwd, absPath);
+    if (info.status === "unsupported") return undefined;
 
-    if (!activeClients.has(cfg.id)) {
-      activeClients.add(cfg.id);
+    if (info.status === "ok" && info.serverId && !activeClients.has(info.serverId)) {
+      activeClients.add(info.serverId);
       updateLspStatus();
     }
 
@@ -776,6 +774,7 @@ export default function (pi: ExtensionAPI) {
     reportedMissingLspKeys.clear();
     bashReportedFiles.clear();
     statusUpdateFn?.("lsp", undefined);
+    statusVisible = false;
   });
 
   pi.on("tool_call", async (event, ctx) => {
@@ -893,12 +892,12 @@ export default function (pi: ExtensionAPI) {
     const filePath = event.input.path as string;
     if (!filePath) return;
 
+    if (hookMode === "disabled") return;
+
     const diagnosticsCtx = snapshotDiagnosticsContext(ctx);
     const normalizedFilePath = normalizeToolFilePath(filePath);
     const absPath = ensureActiveClientForFile(normalizedFilePath, diagnosticsCtx.cwd);
     if (!absPath) return;
-
-    if (hookMode === "disabled") return;
 
     if (hookMode === "agent_end") {
       const includeWarnings = event.toolName === "write";
