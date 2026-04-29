@@ -56,7 +56,7 @@ When the agent edits or writes a supported source file, `pi-lsp` remembers that 
 Depending on `/lsp` settings, diagnostics run either:
 
 - once at the end of the agent turn
-- shortly after each edit/write
+- after each edit/write, appended to that tool result before the next model turn
 - never, if disabled
 
 Diagnostics show up as a compact block:
@@ -269,6 +269,7 @@ Use it after installing a server, changing environment variables, or when diagno
 
 - Unsupported files stay quiet.
 - Missing servers produce one deduped notice per root/language.
+- The edit/write hook blocks the next model turn, but it cannot serialize sibling tool calls that the runtime already launched in the same assistant message.
 - The hook does not interrupt the agent mid-edit with install prompts.
 - Install/update commands are explicit and confirmed in the TUI.
 - `rename` and `codeAction` are preview-only today.

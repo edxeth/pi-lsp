@@ -24,9 +24,9 @@ const DIAGNOSTICS_WAIT_MS_DEFAULT = 3000;
 
 function diagnosticsWaitMsForFile(filePath: string): number {
   const ext = path.extname(filePath).toLowerCase();
-  if ([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue", ".svelte"].includes(ext)) return 15000;
-  if (ext === ".go") return 20000;
-  if (ext === ".rs") return 20000;
+  if ([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue", ".svelte"].includes(ext)) return 5000;
+  if (ext === ".go") return 10000;
+  if (ext === ".rs") return 10000;
   return DIAGNOSTICS_WAIT_MS_DEFAULT;
 }
 
@@ -410,10 +410,16 @@ export default function (pi: ExtensionAPI) {
     pendingMissingLspReports.set(key, output);
   }
 
-  function flushMissingLspReports(): void {
-    if (!pendingMissingLspReports.size || shuttingDown) return;
+  function drainMissingLspReports(): string | undefined {
+    if (!pendingMissingLspReports.size || shuttingDown) return undefined;
     const content = [...pendingMissingLspReports.values()].join("\n\n");
     pendingMissingLspReports.clear();
+    return content;
+  }
+
+  function flushMissingLspReports(): void {
+    const content = drainMissingLspReports();
+    if (!content) return;
     pi.sendMessage({
       customType: "lsp-diagnostics",
       content,
@@ -492,18 +498,26 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function sendDiagnosticsMessage(output: string): void {
+  function sendDiagnosticsMessage(output: string, options: { triggerTurn?: boolean } = { triggerTurn: true }): void {
     pi.sendMessage(
       {
         customType: "lsp-diagnostics",
         content: output,
         display: true,
       },
-      {
-        triggerTurn: true,
-        deliverAs: "steer",
-      }
+      options.triggerTurn
+        ? {
+            triggerTurn: true,
+            deliverAs: "steer",
+          }
+        : undefined
     );
+  }
+
+  function appendDiagnosticsToToolContent(event: { content: unknown }, output: string) {
+    const content = Array.isArray(event.content) ? [...event.content] : [];
+    content.push({ type: "text" as const, text: output.trim() });
+    return { content };
   }
 
   function clearScheduledDiagnostics(): void {
@@ -527,8 +541,7 @@ export default function (pi: ExtensionAPI) {
         } finally {
           if (!shuttingDown && scheduledDiagnostics.size === 0) {
             setActivity("idle");
-            if (diagnosticsCtx.hasUI) scheduleIdleShutdown();
-            else void shutdownLspServersForIdle();
+            scheduleIdleShutdown();
           }
         }
       })();
@@ -862,8 +875,7 @@ export default function (pi: ExtensionAPI) {
       }
     } finally {
       if (!shuttingDown && diagnosticsCtx) {
-        if (diagnosticsCtx.hasUI) scheduleIdleShutdown();
-        else await shutdownLspServersForIdle();
+        scheduleIdleShutdown();
       }
     }
   });
@@ -907,7 +919,21 @@ export default function (pi: ExtensionAPI) {
     }
 
     const includeWarnings = event.toolName === "write";
-    scheduleEditWriteDiagnostics(absPath, diagnosticsCtx, includeWarnings);
-    return;
+    setActivity("working");
+    try {
+      const output = await collectDiagnostics(absPath, diagnosticsCtx, includeWarnings, false);
+      const missingOutput = drainMissingLspReports();
+      const combinedOutput = [output, missingOutput].filter((item): item is string => Boolean(item)).join("\n\n");
+      if (combinedOutput) {
+        sendDiagnosticsMessage(combinedOutput, { triggerTurn: false });
+        return appendDiagnosticsToToolContent(event, combinedOutput);
+      }
+      return;
+    } finally {
+      if (!shuttingDown) {
+        setActivity("idle");
+        scheduleIdleShutdown();
+      }
+    }
   });
 }

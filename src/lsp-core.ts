@@ -76,6 +76,7 @@ interface OpenFile {
 }
 
 interface LSPClient {
+  serverId: string;
   connection: MessageConnection;
   process: ChildProcessWithoutNullStreams;
   diagnostics: Map<string, Diagnostic[]>;
@@ -672,6 +673,7 @@ export class LSPManager {
       handle.process.stderr?.on("error", () => {});
 
       const client: LSPClient = {
+        serverId: config.id,
         connection: conn,
         process: handle.process,
         diagnostics: new Map(),
@@ -911,7 +913,7 @@ export class LSPManager {
     return { clients, absPath, uri: pathToFileURL(absPath).href, langId: this.langId(absPath), content };
   }
 
-  private waitForDiagnostics(client: LSPClient, absPath: string, timeoutMs: number, isNew: boolean): Promise<boolean> {
+  private waitForDiagnostics(client: LSPClient, absPath: string, timeoutMs: number): Promise<boolean> {
     return new Promise((resolve) => {
       if (client.closed) return resolve(false);
 
@@ -942,14 +944,13 @@ export class LSPManager {
         const current = client.diagnostics.get(absPath);
         if (current && current.length > 0) {
           if (settleTimer) clearTimeout(settleTimer);
-          settleTimer = setTimeout(() => finish(true), 1500);
+          settleTimer = setTimeout(() => finish(true), 150);
           return;
         }
 
-        if (!isNew) return finish(true);
-
         if (settleTimer) clearTimeout(settleTimer);
-        settleTimer = setTimeout(() => finish(true), 2500);
+        const emptySettleMs = client.serverId === "rust-analyzer" ? 2500 : 300;
+        settleTimer = setTimeout(() => finish(true), emptySettleMs);
       };
 
       const timer = setTimeout(() => finish(false), timeoutMs);
@@ -1022,10 +1023,9 @@ export class LSPManager {
 
     const uri = pathToFileURL(absPath).href;
     const langId = this.langId(absPath);
-    const isNew = clients.some((c) => !c.openFiles.has(absPath));
     for (const c of clients) c.diagnostics.delete(absPath);
 
-    const waits = clients.map((c) => this.waitForDiagnostics(c, absPath, timeoutMs, isNew));
+    const waits = clients.map((c) => this.waitForDiagnostics(c, absPath, timeoutMs));
     await this.openOrUpdate(clients, absPath, uri, langId, content);
     const results = await Promise.all(waits);
 
@@ -1085,7 +1085,6 @@ export class LSPManager {
 
       const uri = pathToFileURL(absPath).href;
       const langId = this.langId(absPath);
-      const isNew = clients.some((c) => !c.openFiles.has(absPath));
       for (const c of clients) c.diagnostics.delete(absPath);
 
       for (const c of clients) {
@@ -1095,7 +1094,7 @@ export class LSPManager {
         }
       }
 
-      const waits = clients.map((c) => this.waitForDiagnostics(c, absPath, timeoutMs, isNew));
+      const waits = clients.map((c) => this.waitForDiagnostics(c, absPath, timeoutMs));
       await this.openOrUpdate(clients, absPath, uri, langId, content, false);
       const waitResults = await Promise.all(waits);
 
