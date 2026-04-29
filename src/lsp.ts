@@ -48,6 +48,15 @@ function normalizeHookMode(value: unknown): HookMode | undefined {
   return undefined;
 }
 
+export function writeJsonAtomicPreservingSymlink(filePath: string, value: unknown): void {
+  // Preserve user-managed settings.json symlinks, e.g. dotfile managers.
+  const targetPath = fs.existsSync(filePath) ? fs.realpathSync(filePath) : filePath;
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  const tmp = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", "utf-8");
+  fs.renameSync(tmp, targetPath);
+}
+
 interface HookConfigEntry {
   scope: HookScope;
   hookMode?: HookMode;
@@ -91,12 +100,6 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function writeJsonAtomic(filePath: string, value: unknown): void {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", "utf-8");
-    fs.renameSync(tmp, filePath);
-  }
 
   function getGlobalHookMode(): HookMode | undefined {
     const read = readSettingsFile(globalSettingsPath);
@@ -123,7 +126,7 @@ export default function (pi: ExtensionAPI) {
         existing && typeof existing === "object" && !Array.isArray(existing) ? { ...(existing as Record<string, unknown>), hookMode: mode } : { hookMode: mode };
 
       settings[SETTINGS_NAMESPACE] = nextNamespace;
-      writeJsonAtomic(globalSettingsPath, settings);
+      writeJsonAtomicPreservingSymlink(globalSettingsPath, settings);
       return { ok: true };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };

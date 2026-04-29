@@ -15,14 +15,6 @@ The goal is simple: when the agent writes broken code, it should get the same ki
 pi install git:github.com/edxeth/pi-lsp
 ```
 
-If you copied this package without dependencies, run:
-
-```bash
-npm install
-```
-
-inside this directory.
-
 ## Quick start
 
 Turn automatic diagnostics on or off with:
@@ -282,27 +274,6 @@ Use it after installing a server, changing environment variables, or when diagno
 - `rename` and `codeAction` are preview-only today.
 - Bash command path detection is best-effort. It only tracks obvious supported source paths mentioned in the command.
 - Large TypeScript/Rust/Go projects may need a longer cold-start window; `pi-lsp` already gives these languages more time than the default.
-
-## Project layout
-
-```text
-src/index.ts        extension entrypoint
-src/lsp.ts          slash commands and automatic diagnostics hook
-src/lsp-tool.ts     manual lsp tool
-src/lsp-core.ts     LSP client manager, root detection, protocol calls
-src/lsp-registry.ts curated server registry
-src/lsp-installer.ts Pi-cache install/update logic
-src/lsp-paths.ts    Pi settings/cache path handling
-test/               behavior tests
-```
-
-There is also a project prompt for future registry maintenance:
-
-```text
-/maintain-lsp-registry
-```
-
-It compares this registry with OpenCode's registry and guides a future agent through safe updates.
 
 ## Development
 
