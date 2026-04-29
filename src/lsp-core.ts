@@ -5,6 +5,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { pathToFileURL, fileURLToPath } from "node:url";
+import { resolvePiPaths } from "./lsp-paths.js";
+import { LANGUAGE_IDS, getRegistryEntry } from "./lsp-registry.js";
 import {
   createMessageConnection,
   StreamMessageReader,
@@ -16,7 +18,6 @@ import {
   DidChangeTextDocumentNotification,
   DidCloseTextDocumentNotification,
   DidSaveTextDocumentNotification,
-  PublishDiagnosticsNotification,
   DocumentDiagnosticRequest,
   WorkspaceDiagnosticRequest,
   DefinitionRequest,
@@ -50,25 +51,6 @@ const SHUTDOWN_TIMEOUT_MS = 1000;
 const MAX_OPEN_FILES = 30;
 const IDLE_TIMEOUT_MS = 60_000;
 const CLEANUP_INTERVAL_MS = 30_000;
-
-export const LANGUAGE_IDS: Record<string, string> = {
-  ".dart": "dart",
-  ".ts": "typescript",
-  ".tsx": "typescriptreact",
-  ".js": "javascript",
-  ".jsx": "javascriptreact",
-  ".mjs": "javascript",
-  ".cjs": "javascript",
-  ".mts": "typescript",
-  ".cts": "typescript",
-  ".vue": "vue",
-  ".svelte": "svelte",
-  ".astro": "astro",
-  ".py": "python",
-  ".pyi": "python",
-  ".go": "go",
-  ".rs": "rust",
-};
 
 // Types
 interface LSPServerConfig {
@@ -117,28 +99,48 @@ export interface FileDiagnosticsResult {
 }
 
 // Utilities
-const SEARCH_PATHS = Array.from(
-  new Set([
-    ...(process.env.PATH?.split(path.delimiter) || []),
-    "/usr/local/bin",
-    "/opt/homebrew/bin",
-    process.env.BUN_INSTALL ? path.join(process.env.BUN_INSTALL, "bin") : "",
-    `${process.env.HOME}/.bun/bin`,
-    `${process.env.HOME}/.pub-cache/bin`,
-    `${process.env.HOME}/fvm/default/bin`,
-    `${process.env.HOME}/go/bin`,
-    `${process.env.HOME}/.cargo/bin`,
-  ].filter(Boolean))
-);
+function globalSearchPaths(): string[] {
+  return Array.from(
+    new Set([
+      ...(process.env.PATH?.split(path.delimiter) || []),
+      "/usr/local/bin",
+      "/opt/homebrew/bin",
+      process.env.BUN_INSTALL ? path.join(process.env.BUN_INSTALL, "bin") : "",
+      `${process.env.HOME}/.bun/bin`,
+      `${process.env.HOME}/.pub-cache/bin`,
+      `${process.env.HOME}/fvm/default/bin`,
+      `${process.env.HOME}/go/bin`,
+      `${process.env.HOME}/.cargo/bin`,
+    ].filter(Boolean))
+  );
+}
+
+function findExecutableInDirs(cmd: string, dirs: string[]): string | undefined {
+  const exts = process.platform === "win32" ? [".exe", ".cmd", ".bat", ""] : [""];
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      const full = path.join(dir, cmd + ext);
+      try {
+        if (fs.existsSync(full) && fs.statSync(full).isFile()) return full;
+      } catch {}
+    }
+  }
+}
+
+function cachedBin(cmd: string): string | undefined {
+  return findExecutableInDirs(cmd, [resolvePiPaths().lspBinDir]);
+}
+
+function firstDefined(...items: (string | undefined)[]): string | undefined {
+  return items.find((item): item is string => !!item);
+}
+
+function globalBin(cmd: string): string | undefined {
+  return findExecutableInDirs(cmd, globalSearchPaths());
+}
 
 function which(cmd: string): string | undefined {
-  const ext = process.platform === "win32" ? ".exe" : "";
-  for (const dir of SEARCH_PATHS) {
-    const full = path.join(dir, cmd + ext);
-    try {
-      if (fs.existsSync(full) && fs.statSync(full).isFile()) return full;
-    } catch {}
-  }
+  return cachedBin(cmd) || globalBin(cmd);
 }
 
 function projectBin(root: string, cmd: string): string | undefined {
@@ -244,25 +246,37 @@ async function spawnChecked(cmd: string, args: string[], cwd: string): Promise<C
   }
 }
 
-async function spawnWithFallback(cmd: string, argsVariants: string[][], cwd: string): Promise<ChildProcessWithoutNullStreams | undefined> {
-  for (const args of argsVariants) {
-    const child = await spawnChecked(cmd, args, cwd);
-    if (child) return child;
-  }
-  return undefined;
-}
-
 function detectServerBinary(serverId: string, root: string): string | undefined {
   switch (serverId) {
     case "typescript":
-      return projectBin(root, "tsgo")
-        || which("tsgo")
-        || projectBin(root, "typescript-language-server")
-        || which("typescript-language-server");
+      return firstDefined(
+        projectBin(root, "tsgo"),
+        projectBin(root, "typescript-language-server"),
+        cachedBin("tsgo"),
+        cachedBin("typescript-language-server"),
+        globalBin("tsgo"),
+        globalBin("typescript-language-server")
+      );
     case "vue":
       return projectBin(root, "vue-language-server") || which("vue-language-server");
     case "svelte":
       return projectBin(root, "svelteserver") || which("svelteserver");
+    case "bash":
+      return projectBin(root, "bash-language-server") || which("bash-language-server");
+    case "yaml-ls":
+      return projectBin(root, "yaml-language-server") || which("yaml-language-server");
+    case "dockerfile":
+      return projectBin(root, "docker-langserver") || which("docker-langserver");
+    case "php-intelephense":
+      return projectBin(root, "intelephense") || which("intelephense");
+    case "prisma":
+      return projectBin(root, "prisma") || which("prisma");
+    case "terraform":
+      return projectBin(root, "terraform-ls") || which("terraform-ls");
+    case "clangd":
+      return projectBin(root, "clangd") || which("clangd");
+    case "lua-ls":
+      return projectBin(root, "lua-language-server") || which("lua-language-server");
     case "pyright":
       return projectBin(root, "pyright-langserver") || which("pyright-langserver");
     case "gopls":
@@ -294,6 +308,22 @@ function detectServerBinary(serverId: string, root: string): string | undefined 
   }
 }
 
+function fileMatchKeys(absPath: string): string[] {
+  return [path.extname(absPath), path.basename(absPath)].filter(Boolean);
+}
+
+function serverMatchesFile(config: LSPServerConfig, absPath: string): boolean {
+  return fileMatchKeys(absPath).some((key) => config.extensions.includes(key));
+}
+
+function languageIdForFile(fp: string): string {
+  for (const key of fileMatchKeys(fp)) {
+    const languageId = LANGUAGE_IDS[key];
+    if (languageId) return languageId;
+  }
+  return "plaintext";
+}
+
 function explainNoLspReason(cwd: string, absPath: string): string {
   const ext = path.extname(absPath);
 
@@ -316,7 +346,7 @@ export function inspectLspForFile(cwd: string, filePath: string): LspInspection 
   const ext = path.extname(absPath);
 
   for (const config of LSP_SERVERS) {
-    if (!config.extensions.includes(ext)) continue;
+    if (!serverMatchesFile(config, absPath)) continue;
     const root = config.findRoot(absPath, cwd);
     if (!root) continue;
 
@@ -331,7 +361,7 @@ export function inspectLspForFile(cwd: string, filePath: string): LspInspection 
       serverId: config.id,
       root,
       status: "missing-binary",
-      reason: `Project root detected, but no ${config.id} language-server binary was found.`,
+      reason: `Project root detected, but no ${getRegistryEntry(config.id)?.displayName ?? config.id} language-server binary was found.`,
     };
   }
 
@@ -342,7 +372,7 @@ export function inspectLspForFile(cwd: string, filePath: string): LspInspection 
 export const LSP_SERVERS: LSPServerConfig[] = [
   {
     id: "dart",
-    extensions: [".dart"],
+    extensions: getRegistryEntry("dart")?.extensions ?? [".dart"],
     findRoot: (f, cwd) => findRoot(f, cwd, ["pubspec.yaml", "analysis_options.yaml"]),
     spawn: async (root) => {
       let dart = which("dart");
@@ -371,53 +401,110 @@ export const LSP_SERVERS: LSPServerConfig[] = [
   },
   {
     id: "typescript",
-    extensions: [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"],
+    extensions: getRegistryEntry("typescript")?.extensions ?? [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"],
     findRoot: (f, cwd) => {
       // Skip if this is a Deno project
       if (findNearestFile(path.dirname(f), ["deno.json", "deno.jsonc"], cwd)) return undefined;
       return findRoot(f, cwd, ["package.json", "tsconfig.json", "jsconfig.json"]);
     },
     spawn: async (root) => {
-      // Prefer project-local tsgo first, then PATH tsgo. It's much faster than TSServer.
-      const tsgo = projectBin(root, "tsgo") || which("tsgo");
-      if (tsgo) {
-        const proc = await spawnChecked(tsgo, ["--lsp", "--stdio"], root);
-        if (proc) return { process: proc };
+      const candidates = [
+        { cmd: projectBin(root, "tsgo"), args: ["--lsp", "--stdio"] },
+        { cmd: projectBin(root, "typescript-language-server"), args: ["--stdio"] },
+        { cmd: cachedBin("tsgo"), args: ["--lsp", "--stdio"] },
+        { cmd: cachedBin("typescript-language-server"), args: ["--stdio"] },
+        { cmd: globalBin("tsgo"), args: ["--lsp", "--stdio"] },
+        { cmd: globalBin("typescript-language-server"), args: ["--stdio"] },
+      ];
+
+      for (const candidate of candidates) {
+        if (!candidate.cmd) continue;
+        if (path.basename(candidate.cmd).startsWith("tsgo")) {
+          const proc = await spawnChecked(candidate.cmd, candidate.args, root);
+          if (proc) return { process: proc };
+          continue;
+        }
+        return { process: spawn(candidate.cmd, candidate.args, { cwd: root, stdio: ["pipe", "pipe", "pipe"] }) };
       }
 
-      // Fall back to project-local or global typescript-language-server.
-      const cmd = projectBin(root, "typescript-language-server") || which("typescript-language-server");
-      if (!cmd) return undefined;
-      return { process: spawn(cmd, ["--stdio"], { cwd: root, stdio: ["pipe", "pipe", "pipe"] }) };
+      return undefined;
     },
   },
   {
     id: "vue",
-    extensions: [".vue"],
+    extensions: getRegistryEntry("vue")?.extensions ?? [".vue"],
     findRoot: (f, cwd) => findRoot(f, cwd, ["package.json", "vite.config.ts", "vite.config.js"]),
     spawn: simpleSpawn("vue-language-server"),
   },
   {
     id: "svelte",
-    extensions: [".svelte"],
+    extensions: getRegistryEntry("svelte")?.extensions ?? [".svelte"],
     findRoot: (f, cwd) => findRoot(f, cwd, ["package.json", "svelte.config.js"]),
     spawn: simpleSpawn("svelteserver"),
   },
   {
     id: "pyright",
-    extensions: [".py", ".pyi"],
+    extensions: getRegistryEntry("pyright")?.extensions ?? [".py", ".pyi"],
     findRoot: (f, cwd) => findRoot(f, cwd, ["pyproject.toml", "setup.py", "requirements.txt", "pyrightconfig.json"]),
     spawn: simpleSpawn("pyright-langserver"),
   },
   {
+    id: "bash",
+    extensions: getRegistryEntry("bash")?.extensions ?? [".sh", ".bash", ".zsh", ".ksh"],
+    findRoot: (_f, cwd) => cwd,
+    spawn: simpleSpawn("bash-language-server", ["start"]),
+  },
+  {
+    id: "yaml-ls",
+    extensions: getRegistryEntry("yaml-ls")?.extensions ?? [".yaml", ".yml"],
+    findRoot: (f, cwd) => findRoot(f, cwd, ["package.json", "package-lock.json", "bun.lock", "pnpm-lock.yaml", "yarn.lock"]),
+    spawn: simpleSpawn("yaml-language-server", ["--stdio"]),
+  },
+  {
+    id: "dockerfile",
+    extensions: getRegistryEntry("dockerfile")?.extensions ?? [".dockerfile", "Dockerfile"],
+    findRoot: (_f, cwd) => cwd,
+    spawn: simpleSpawn("docker-langserver", ["--stdio"]),
+  },
+  {
+    id: "php-intelephense",
+    extensions: getRegistryEntry("php-intelephense")?.extensions ?? [".php"],
+    findRoot: (f, cwd) => findRoot(f, cwd, ["composer.json", "composer.lock", ".php-version"]),
+    spawn: simpleSpawn("intelephense", ["--stdio"]),
+  },
+  {
+    id: "prisma",
+    extensions: getRegistryEntry("prisma")?.extensions ?? [".prisma"],
+    findRoot: (f, cwd) => findRoot(f, cwd, ["schema.prisma", "package.json"]),
+    spawn: simpleSpawn("prisma", ["language-server"]),
+  },
+  {
+    id: "terraform",
+    extensions: getRegistryEntry("terraform")?.extensions ?? [".tf", ".tfvars"],
+    findRoot: (_f, cwd) => cwd,
+    spawn: simpleSpawn("terraform-ls", ["serve"]),
+  },
+  {
+    id: "clangd",
+    extensions: getRegistryEntry("clangd")?.extensions ?? [".c", ".cpp", ".cc", ".cxx", ".h", ".hpp"],
+    findRoot: (f, cwd) => findRoot(f, cwd, ["compile_commands.json", "compile_flags.txt", ".clangd"]),
+    spawn: simpleSpawn("clangd", []),
+  },
+  {
+    id: "lua-ls",
+    extensions: getRegistryEntry("lua-ls")?.extensions ?? [".lua"],
+    findRoot: (f, cwd) => findRoot(f, cwd, [".luarc.json", ".luarc.jsonc", ".luacheckrc", ".stylua.toml", "stylua.toml", "selene.toml", "selene.yml"]),
+    spawn: simpleSpawn("lua-language-server", []),
+  },
+  {
     id: "gopls",
-    extensions: [".go"],
+    extensions: getRegistryEntry("gopls")?.extensions ?? [".go"],
     findRoot: (f, cwd) => findRoot(f, cwd, ["go.work"]) || findRoot(f, cwd, ["go.mod"]),
     spawn: simpleSpawn("gopls", []),
   },
   {
     id: "rust-analyzer",
-    extensions: [".rs"],
+    extensions: getRegistryEntry("rust-analyzer")?.extensions ?? [".rs"],
     findRoot: (f, cwd) => findRoot(f, cwd, ["Cargo.toml"]),
     spawn: simpleSpawn("rust-analyzer", []),
   },
@@ -529,11 +616,10 @@ export class LSPManager {
   }
 
   describeUnavailableForFile(filePath: string): string | undefined {
-    const ext = path.extname(filePath);
     const absPath = this.resolve(filePath);
 
     for (const config of LSP_SERVERS) {
-      if (!config.extensions.includes(ext)) continue;
+      if (!serverMatchesFile(config, absPath)) continue;
       const root = config.findRoot(absPath, this.cwd);
       if (!root) return this.explainNoLsp(absPath);
 
@@ -696,12 +782,11 @@ export class LSPManager {
   }
 
   async getClientsForFile(filePath: string): Promise<LSPClient[]> {
-    const ext = path.extname(filePath);
     const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(this.cwd, filePath);
     const clients: LSPClient[] = [];
 
     for (const config of LSP_SERVERS) {
-      if (!config.extensions.includes(ext)) continue;
+      if (!serverMatchesFile(config, absPath)) continue;
       const root = config.findRoot(absPath, this.cwd);
       if (!root) continue;
       const k = this.key(config.id, root);
@@ -733,7 +818,7 @@ export class LSPManager {
   }
 
   private langId(fp: string) {
-    return LANGUAGE_IDS[path.extname(fp)] || "plaintext";
+    return languageIdForFile(fp);
   }
 
   private readFile(fp: string): string | null {
@@ -771,7 +856,6 @@ export class LSPManager {
         selectionRange: s.location.range,
         detail: s.containerName,
         tags: s.tags,
-        deprecated: s.deprecated,
         children: [],
       }));
     }

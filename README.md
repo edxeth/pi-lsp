@@ -1,14 +1,13 @@
 # pi-lsp
 
-Local Language Server Protocol extension for pi.
+`pi-lsp` gives Pi a small local LSP layer: enough editor intelligence for an agent, without turning Pi into an IDE.
 
-`pi-lsp` adds three pieces of functionality:
+It does two things:
 
-- an `lsp` tool for on-demand LSP queries
-- a `/lsp` command for configuring automatic diagnostics
-- a `/lsp-doctor <file>` command for inspecting root and binary detection
+- exposes an `lsp` tool for explicit model queries like diagnostics, hover, symbols, definitions, and references
+- watches files the agent edits and posts LSP diagnostics back into the session
 
-It is optimized for day-to-day JavaScript, TypeScript, and Go work, but also supports Python, Dart, Vue, Svelte, and Rust.
+The goal is simple: when the agent writes broken code, it should get the same kind of feedback a human gets from an editor.
 
 ## Install
 
@@ -16,417 +15,310 @@ It is optimized for day-to-day JavaScript, TypeScript, and Go work, but also sup
 pi install git:github.com/edxeth/pi-lsp
 ```
 
-## What it does
-
-### 1. Manual LSP tool
-
-The `lsp` tool lets the model query language servers directly for:
-
-- definitions
-- references
-- hover
-- signature help
-- document symbols
-- diagnostics
-- workspace diagnostics across multiple files
-- rename
-- code actions
-- restart
-
-This is useful when you want the model to answer questions like:
-
-- "Where is this symbol defined?"
-- "Find all references to this function"
-- "What type is this value?"
-- "Check these files for diagnostics"
-- "What quick fixes exist here?"
-
-### 2. Automatic diagnostics hook
-
-The `/lsp` command configures when diagnostics run automatically:
-
-- **At agent end**: run once after the agent finishes its response
-- **After each edit/write**: run immediately after each edit or write
-- **Disabled**: turn off the automatic hook entirely
-
-The setting can be applied to:
-
-- **Session only**
-- **Global (all sessions)**
-
-### 3. LSP doctor
-
-The `/lsp-doctor <file>` command shows how `pi-lsp` is interpreting a file:
-
-- detected status
-- chosen language server
-- detected project root
-- resolved binary path
-- unsupported or missing-binary reason
-
-Example:
-
-```text
-/lsp-doctor src/cli/args.ts
-
-file: /path/to/project/src/cli/args.ts
-status: ok
-server: typescript
-root: /path/to/project
-binary: /home/user/.bun/bin/typescript-language-server
-```
-
-## Supported languages
-
-`pi-lsp` currently supports:
-
-- **JavaScript / TypeScript** via `tsgo` or `typescript-language-server`
-- **Go** via `gopls`
-- **Python** via `pyright-langserver`
-- **Dart / Flutter** via `dart language-server`
-- **Vue** via `vue-language-server`
-- **Svelte** via `svelteserver`
-- **Rust** via `rust-analyzer`
-
-## Project root detection
-
-The extension only activates LSP for files that belong to a recognized project root.
-
-### JavaScript / TypeScript
-
-Root markers:
-
-- `package.json`
-- `tsconfig.json`
-- `jsconfig.json`
-
-Notes:
-
-- nearest matching config wins
-- **Deno** projects are intentionally skipped if `deno.json` or `deno.jsonc` is found
-
-### Go
-
-Root markers:
-
-- `go.work`
-- `go.mod`
-
-Notes:
-
-- `go.work` is preferred when present
-- this works well for Go workspaces and multi-module repos
-
-### Python
-
-Root markers:
-
-- `pyproject.toml`
-- `setup.py`
-- `requirements.txt`
-- `pyrightconfig.json`
-
-### Dart / Flutter
-
-Root markers:
-
-- `pubspec.yaml`
-- `analysis_options.yaml`
-
-### Vue
-
-Root markers:
-
-- `package.json`
-- `vite.config.ts`
-- `vite.config.js`
-
-### Svelte
-
-Root markers:
-
-- `package.json`
-- `svelte.config.js`
-
-### Rust
-
-Root markers:
-
-- `Cargo.toml`
-
-## Binary detection
-
-Once a root is found, `pi-lsp` looks for the language-server binary.
-
-### JavaScript / TypeScript order
-
-For JS/TS projects, the detection order is:
-
-1. local `node_modules/.bin/tsgo`
-2. global `tsgo`
-3. local `node_modules/.bin/typescript-language-server`
-4. global `typescript-language-server`
-
-This makes local project tools win when available.
-
-### Other languages
-
-For the other supported languages, detection checks:
-
-- local `node_modules/.bin/...` when applicable
-- `PATH`
-- additional common binary locations
-
-Extra search locations include:
-
-- `/usr/local/bin`
-- `/opt/homebrew/bin`
-- `~/.bun/bin`
-- `$BUN_INSTALL/bin`
-- `~/.pub-cache/bin`
-- `~/fvm/default/bin`
-- `~/go/bin`
-- `~/.cargo/bin`
-
-This means Bun-global installs are supported automatically for binaries such as:
-
-- `typescript-language-server`
-- `pyright-langserver`
-
-## Commands
-
-### `/lsp`
-
-Opens the auto-diagnostics settings UI.
-
-You can choose:
-
-- `After each edit/write`
-- `At agent end`
-- `Disabled`
-
-And then choose scope:
-
-- `Session only`
-- `Global (all sessions)`
-
-### `/lsp-restart`
-
-Restarts all running LSP servers.
-
-Use this if:
-
-- a language server gets stuck
-- diagnostics seem stale
-- you changed tool installation or environment variables and want a fresh start
-
-### `/lsp-doctor <file>`
-
-Shows how the extension resolves a file.
-
-Use this when:
-
-- a file is not getting diagnostics
-- you are unsure which root was selected
-- you want to confirm that the expected language-server binary is being used
-
-## The `lsp` tool
-
-Supported actions:
-
-- `definition`
-- `references`
-- `hover`
-- `symbols`
-- `diagnostics`
-- `workspace-diagnostics`
-- `signature`
-- `rename` (preview only; returns a workspace edit)
-- `codeAction` (preview/list only)
-- `restart`
-
-### Parameters
-
-Common parameters:
-
-- `file`
-- `files`
-- `line`
-- `column`
-- `endLine`
-- `endColumn`
-- `query`
-- `newName`
-- `severity`
-
-### Notes
-
-- position-based actions can use `line` + `column`
-- for many actions, `query` can be used instead of an exact position if the symbol can be found in the file
-- `workspace-diagnostics` accepts multiple files
-- `severity` can filter results: `all`, `error`, `warning`, `info`, `hint`
-
-## Automatic diagnostics behavior
-
-The auto hook is designed to avoid bloating context unnecessarily.
-
-### What it tracks
-
-It tracks files from supported LSP-backed extensions that were touched by:
-
-- `edit`
-- `write`
-- manual `lsp` interactions
-- best-effort `bash` command path detection for commands that mention supported source files
-
-### What it skips
-
-It does **not** automatically run diagnostics for unsupported files such as:
-
-- Markdown
-- plain text
-- arbitrary config files with no registered LSP mapping
-
-It also stays quiet when a matching project root exists but the language-server binary is not installed. Use `/lsp-doctor <file>` if you want to inspect that state explicitly.
-
-So unsupported files and missing language-server binaries do not get added to the LSP diagnostics summary and do not generate extra LSP context noise.
-
-### Agent-end mode
-
-In `At agent end` mode:
-
-- touched compatible files are collected during the response
-- diagnostics run once after the final assistant turn for that response
-- the result is posted as a single diagnostics message
-
-This is usually the best default if you want less interruption.
-
-### Edit/write mode
-
-In `After each edit/write` mode:
-
-- diagnostics run immediately after each edit or write
-- diagnostics messages are styled by severity in the UI, with errors shown using the error color
-- results are appended sooner
-- this is more interactive but can be noisier
-
-## Performance characteristics
-
-`pi-lsp` keeps LSP usage bounded.
-
-### Reuse
-
-- one LSP client is reused per detected project root
-- clients are kept around across turns until idle shutdown
-
-### Open file limits
-
-- open files are managed with an LRU strategy
-- maximum open files per LSP client: **30**
-
-### Idle cleanup
-
-- idle files are closed automatically
-- all LSP servers are shut down after a period of post-agent inactivity
-
-### Warmup
-
-On session start, the extension can warm up an LSP client based on common root markers such as:
-
-- `package.json`
-- `tsconfig.json`
-- `jsconfig.json`
-- `go.work`
-- `go.mod`
-- `pyproject.toml`
-- `pubspec.yaml`
-- `Cargo.toml`
-
-## Language-specific notes
-
-### JavaScript / TypeScript
-
-- prefers `tsgo` when available because it is typically faster
-- otherwise uses `typescript-language-server`
-- Deno roots are intentionally excluded
-
-### Go
-
-- supports both `go.work` and `go.mod`
-- uses a longer diagnostics wait window than the default to reduce false timeouts on cold starts
-
-### Rust
-
-- `rust-analyzer` can be noticeably slow on cold startup
-- first diagnostics may take longer on larger projects
-
-### Dart / Flutter
-
-- if a Flutter project is detected, the extension tries to use the Dart binary associated with Flutter when possible
-
-## Installation / packaging
-
-This directory is a standard pi extension package.
-
-Important files:
-
-- `index.ts` — entry point loading both tool and hook
-- `lsp-core.ts` — LSP manager, root detection, and protocol logic
-- `lsp-tool.ts` — `lsp` tool implementation
-- `lsp.ts` — hook commands, auto diagnostics, and `/lsp-doctor`
-- `package.json` — extension metadata and dependencies
-
-### If you copy or zip this extension
-
-If the package is copied without `node_modules`, run:
+If you copied this package without dependencies, run:
 
 ```bash
 npm install
 ```
 
-inside the `pi-lsp` directory before using it.
+inside this directory.
 
-## Examples
+## Quick start
 
-### Diagnose why a TypeScript file is not working
+Turn automatic diagnostics on or off with:
+
+```text
+/lsp
+```
+
+Check why a file is or is not using LSP:
 
 ```text
 /lsp-doctor src/index.ts
 ```
 
-### Check diagnostics manually
+Install a known language server into Pi's cache:
 
 ```text
-Use lsp action=diagnostics file=src/index.ts severity=error
+/lsp-install typescript
 ```
 
-### Check several files at once
+Update/reinstall a cached server:
 
 ```text
-Use lsp action=workspace-diagnostics files=["src/a.ts","src/b.ts"] severity=warning
+/lsp-update typescript
 ```
 
-### Restart LSP servers
+Ask the model to query LSP directly:
 
 ```text
-/lsp-restart
+Use lsp action=diagnostics file=src/index.ts severity=all
+Use lsp action=hover file=src/index.ts query=myFunction
+Use lsp action=references file=src/index.ts query=myFunction
 ```
 
-## Caveats
+## What the automatic hook does
 
-- unsupported file types are ignored by the auto hook
-- Deno projects are intentionally skipped by the JS/TS LSP integration
-- a recognized project root is required before a server will start
-- the language-server binary still has to be installed somewhere discoverable
-- `rename` and `codeAction` currently preview edits/actions; they do not apply changes
-- bash auto-detection is best-effort and only runs when a supported source path is visible in the command text
+When the agent edits or writes a supported source file, `pi-lsp` remembers that file.
 
-## Summary
+Depending on `/lsp` settings, diagnostics run either:
 
-Use:
+- once at the end of the agent turn
+- shortly after each edit/write
+- never, if disabled
 
-- `/lsp` to control auto diagnostics
-- `/lsp-doctor <file>` to inspect resolution and troubleshoot detection
-- `lsp` tool calls when the model needs direct language-server data
+Diagnostics show up as a compact block:
 
-For JS/TS/Go-heavy workflows, this setup should be a solid default with low noise and useful diagnostics.
+```text
+LSP diagnostics src/example.ts
+ERROR [12:7] Type 'number' is not assignable to type 'string'.
+HINT [12:7] 'value' is declared but its value is never read.
+```
+
+Missing language servers are reported once per session/root/language, not on every edit. Deleted or renamed files are ignored rather than producing stale “file not found” noise.
+
+## The `lsp` tool
+
+The tool is for explicit queries. The hook is passive feedback; the tool is active investigation.
+
+Supported actions:
+
+- `diagnostics`
+- `workspace-diagnostics`
+- `symbols`
+- `hover`
+- `definition`
+- `references`
+- `signature`
+- `rename` preview
+- `codeAction` preview
+- `restart`
+
+Useful parameters:
+
+- `file`
+- `files`
+- `line`
+- `column`
+- `query`
+- `severity`
+- `newName`
+
+For many position-based actions, `query` can be used instead of an exact line/column. The extension resolves the symbol position before making the LSP request.
+
+## Language servers
+
+`pi-lsp` keeps a curated registry of known servers. It does not scrape npm, guess package names, or mutate your project by default.
+
+| ID | Language/server | Install behavior |
+| --- | --- | --- |
+| `typescript` | TypeScript / JavaScript | Pi-cache npm package |
+| `vue` | Vue | Pi-cache npm package |
+| `svelte` | Svelte | Pi-cache npm package |
+| `pyright` | Python / Pyright | Pi-cache npm package |
+| `bash` | Bash / shell scripts | Pi-cache npm package |
+| `yaml-ls` | YAML | Pi-cache npm package |
+| `dockerfile` | Dockerfile | Pi-cache npm package |
+| `php-intelephense` | PHP / Intelephense | Pi-cache npm package |
+| `gopls` | Go | Pi-cache `go install` |
+| `prisma` | Prisma | manual hint |
+| `terraform` | Terraform | manual hint |
+| `clangd` | C / C++ / Objective-C | manual hint |
+| `lua-ls` | Lua | manual hint |
+| `rust-analyzer` | Rust | manual hint |
+| `dart` | Dart / Flutter | manual hint |
+
+“Pi-cache” means the server is installed under:
+
+```text
+~/.pi/cache/lsp
+```
+
+Binaries are linked under:
+
+```text
+~/.pi/cache/lsp/bin
+```
+
+You can override this location with:
+
+```bash
+PI_LSP_CACHE_DIR=/some/other/cache
+```
+
+Node-based installs use Pi's configured `npmCommand` from the active agent settings file. So if your Pi settings say:
+
+```json
+{
+  "npmCommand": ["bun"]
+}
+```
+
+then `/lsp-install typescript` uses `bun add ...` inside Pi's LSP cache.
+
+If `PI_CODING_AGENT_DIR` is set, settings are read from:
+
+```text
+$PI_CODING_AGENT_DIR/settings.json
+```
+
+## Resolution order
+
+When a file has a recognized project root, `pi-lsp` looks for the server in this order:
+
+```text
+project-local binary
+Pi LSP cache
+global/PATH/common locations
+```
+
+This is intentional.
+
+Project-local binaries are the project contract. Pi-cache binaries are what `/lsp-install` and `/lsp-update` manage. Global binaries are a fallback.
+
+For TypeScript/JavaScript, the order is a little more specific:
+
+```text
+node_modules/.bin/tsgo
+node_modules/.bin/typescript-language-server
+~/.pi/cache/lsp/bin/tsgo
+~/.pi/cache/lsp/bin/typescript-language-server
+global tsgo
+global typescript-language-server
+```
+
+Deno projects are skipped intentionally when `deno.json` or `deno.jsonc` is found.
+
+## Root detection
+
+`pi-lsp` only starts a server when it can find a reasonable root. A few examples:
+
+| Server | Root markers |
+| --- | --- |
+| TypeScript / JavaScript | `package.json`, `tsconfig.json`, `jsconfig.json` |
+| Vue | `package.json`, `vite.config.ts`, `vite.config.js` |
+| Svelte | `package.json`, `svelte.config.js` |
+| Python | `pyproject.toml`, `setup.py`, `requirements.txt`, `pyrightconfig.json` |
+| Go | `go.work`, `go.mod` |
+| Rust | `Cargo.toml` |
+| Dart / Flutter | `pubspec.yaml`, `analysis_options.yaml` |
+| PHP | `composer.json`, `composer.lock`, `.php-version` |
+| Lua | `.luarc.json`, `.luarc.jsonc`, `.luacheckrc`, `.stylua.toml`, `stylua.toml`, `selene.toml`, `selene.yml` |
+| clangd | `compile_commands.json`, `compile_flags.txt`, `.clangd` |
+
+Some lightweight servers use the current working directory as root, for example shell scripts and Dockerfiles.
+
+## Commands
+
+### `/lsp`
+
+Opens the diagnostics settings UI.
+
+Modes:
+
+- `At agent end`
+- `After each edit/write`
+- `Disabled`
+
+Scope:
+
+- session only
+- global
+
+### `/lsp-doctor <file>`
+
+Shows what `pi-lsp` sees for one file:
+
+```text
+/lsp-doctor src/index.ts
+```
+
+Example output:
+
+```text
+file: /repo/src/index.ts
+status: ok
+server: typescript
+root: /repo
+binary: /repo/node_modules/.bin/typescript-language-server
+```
+
+If the server is missing and the registry knows how to repair it, doctor shows the exact install command and offers to run it.
+
+### `/lsp-install <server>`
+
+Installs a known server into Pi's LSP cache. It does not add dependencies to the current project.
+
+```text
+/lsp-install pyright
+/lsp-install gopls
+/lsp-install yaml-ls
+```
+
+Manual-only servers print a hint instead of trying to install toolchains or SDKs behind your back.
+
+### `/lsp-update <server>`
+
+Runs the same install plan again. This is the update path for Pi-managed servers.
+
+```text
+/lsp-update typescript
+```
+
+If you already have a global server and then run `/lsp-update`, the Pi-cache version wins afterward. That is the point: update means “use the Pi-managed one from now on.”
+
+### `/lsp-restart`
+
+Restarts all running LSP clients.
+
+Use it after installing a server, changing environment variables, or when diagnostics feel stale.
+
+## Behavior notes
+
+- Unsupported files stay quiet.
+- Missing servers produce one deduped notice per root/language.
+- The hook does not interrupt the agent mid-edit with install prompts.
+- Install/update commands are explicit and confirmed in the TUI.
+- `rename` and `codeAction` are preview-only today.
+- Bash command path detection is best-effort. It only tracks obvious supported source paths mentioned in the command.
+- Large TypeScript/Rust/Go projects may need a longer cold-start window; `pi-lsp` already gives these languages more time than the default.
+
+## Project layout
+
+```text
+src/index.ts        extension entrypoint
+src/lsp.ts          slash commands and automatic diagnostics hook
+src/lsp-tool.ts     manual lsp tool
+src/lsp-core.ts     LSP client manager, root detection, protocol calls
+src/lsp-registry.ts curated server registry
+src/lsp-installer.ts Pi-cache install/update logic
+src/lsp-paths.ts    Pi settings/cache path handling
+test/               behavior tests
+```
+
+There is also a project prompt for future registry maintenance:
+
+```text
+/maintain-lsp-registry
+```
+
+It compares this registry with OpenCode's registry and guides a future agent through safe updates.
+
+## Development
+
+```bash
+bun test
+bun run check
+```
+
+For live extension checks, load this package explicitly:
+
+```bash
+tia pi --no-extensions -e ./src/index.ts --no-session
+```
+
+Use a temporary cache when testing installs:
+
+```bash
+PI_LSP_CACHE_DIR=/tmp/pi-lsp-test-cache tia pi --no-extensions -e ./src/index.ts --no-session
+```

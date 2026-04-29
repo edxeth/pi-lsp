@@ -19,7 +19,7 @@
 import * as path from "node:path";
 import { Type, type Static } from "typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { SignatureHelp, WorkspaceEdit, CodeAction, Command } from "vscode-languageserver-protocol";
 import { getOrCreateManager, shutdownManager, formatDiagnostic, filterDiagnosticsBySeverity, uriToPath, resolvePosition, type SeverityFilter } from "./lsp-core.js";
@@ -27,8 +27,24 @@ import { getOrCreateManager, shutdownManager, formatDiagnostic, filterDiagnostic
 const PREVIEW_LINES = 10;
 const DIAGNOSTICS_WAIT_MS_DEFAULT = 3000;
 
+function styleToolResultLine(line: string, theme: Parameters<NonNullable<ToolDefinition["renderResult"]>>[2]): string {
+  if (/^(ERROR|FATAL)\b/i.test(line)) return theme.fg("error", line);
+  if (/^(WARN|WARNING)\b/i.test(line) || /^(Unsupported|Timeout|LSP unavailable)\b/i.test(line)) return theme.fg("warning", line);
+  if (/^INFO\b/i.test(line)) return theme.fg("muted", line);
+  if (/^HINT\b/i.test(line)) return theme.fg("dim", line);
+  return theme.fg("toolOutput", line);
+}
+
+function normalizeToolFilePath(filePath: string | undefined): string | undefined {
+  if (!filePath) return undefined;
+  const trimmed = filePath.trim();
+  const match = /^(?:file|path)=(.+)$/i.exec(trimmed);
+  return match ? match[1].trim() : trimmed;
+}
+
 function diagnosticsWaitMsForFile(filePath: string): number {
   const ext = path.extname(filePath).toLowerCase();
+  if ([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue", ".svelte"].includes(ext)) return 15000;
   if (ext === ".go") return 8000;
   if (ext === ".rs") return 20000;
   return DIAGNOSTICS_WAIT_MS_DEFAULT;
@@ -236,7 +252,9 @@ Use find/grep or bash to locate files before querying LSP positions.`,
       const { signal, ctx } = normalizeExecuteArgs(signalArg, onUpdateArg, ctxArg);
       if (signal?.aborted) return cancelledToolResult();
       const manager = getOrCreateManager(ctx.cwd);
-      const { action, file, files, line, column, endLine, endColumn, query, newName, severity } = params as LspParamsType;
+      const { action, files, line, column, endLine, endColumn, query, newName, severity } = params as LspParamsType;
+      const file = normalizeToolFilePath((params as LspParamsType).file);
+      const normalizedFiles = files?.map(normalizeToolFilePath).filter((item): item is string => !!item);
       const sevFilter: SeverityFilter = severity || "all";
       const needsFile = action !== "workspace-diagnostics" && action !== "restart";
       const needsPos = ["definition", "references", "hover", "signature", "rename", "codeAction"].includes(action);
@@ -294,19 +312,19 @@ Use find/grep or bash to locate files before querying LSP positions.`,
           case "diagnostics": {
             const result = await abortable(manager.touchFileAndWait(file!, diagnosticsWaitMsForFile(file!)), signal);
             const filtered = filterDiagnosticsBySeverity(result.diagnostics, sevFilter);
-            const payload = result.unsupported
+            const body = result.unsupported
               ? `Unsupported: ${result.error || "No LSP for this file."}`
               : !result.receivedResponse
                 ? "Timeout: LSP server did not respond. Try again."
                 : filtered.length
                   ? filtered.map(formatDiagnostic).join("\n")
                   : "No diagnostics.";
-            return { content: [{ type: "text", text: `action: diagnostics\n${sevLine}${payload}` }], details: { ...result, diagnostics: filtered } };
+            return { content: [{ type: "text", text: `${sevLine}${body}` }], details: { ...result, diagnostics: filtered } };
           }
           case "workspace-diagnostics": {
-            if (!files?.length) throw new Error('Action "workspace-diagnostics" requires a "files" array.');
-            const waitMs = Math.max(...files.map(diagnosticsWaitMsForFile));
-            const result = await abortable(manager.getDiagnosticsForFiles(files, waitMs), signal);
+            if (!normalizedFiles?.length) throw new Error('Action "workspace-diagnostics" requires a "files" array.');
+            const waitMs = Math.max(...normalizedFiles.map(diagnosticsWaitMsForFile));
+            const result = await abortable(manager.getDiagnosticsForFiles(normalizedFiles, waitMs), signal);
             const out: string[] = [];
             let errors = 0,
               warnings = 0,
@@ -394,7 +412,7 @@ Use find/grep or bash to locate files before querying LSP positions.`,
       let out = header.map((l: string) => theme.fg("muted", l)).join("\n");
       if (display.length) {
         if (out) out += "\n";
-        out += display.map((l: string) => theme.fg("toolOutput", l)).join("\n");
+        out += display.map((l: string) => styleToolResultLine(l, theme)).join("\n");
       }
       if (remaining > 0) out += theme.fg("dim", `\n... (${remaining} more lines)`);
 
