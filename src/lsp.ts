@@ -13,6 +13,7 @@ import { type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-codin
 import { Box, Text } from "@mariozechner/pi-tui";
 import { type Diagnostic } from "vscode-languageserver-protocol";
 import { LSP_SERVERS, formatDiagnostic, getOrCreateManager, inspectLspForFile, shutdownManager, type LspInspection } from "./lsp-core.js";
+import { formatBoundedDiagnostics, HOOK_DIAGNOSTIC_BUDGET } from "./diagnostic-output.js";
 import { buildInstallPlan, formatCommand, formatRepairBlock, installLspServer } from "./lsp-installer.js";
 import { resolvePiPaths } from "./lsp-paths.js";
 import { getRegistryEntry, LSP_REGISTRY } from "./lsp-registry.js";
@@ -434,7 +435,7 @@ export default function (pi: ExtensionAPI) {
   ): string {
     const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
     const relativePath = path.relative(cwd, absPath);
-    return `\nLSP diagnostics ${relativePath}\n${diagnostics.map(formatDiagnostic).join("\n")}\n`;
+    return `\n${formatBoundedDiagnostics(relativePath, diagnostics, HOOK_DIAGNOSTIC_BUDGET)}\n`;
   }
 
   async function collectDiagnostics(

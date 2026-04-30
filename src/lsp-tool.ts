@@ -19,13 +19,20 @@
 import * as path from "node:path";
 import { Type, type Static } from "typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
-import type { ExtensionAPI, ToolDefinition } from "@mariozechner/pi-coding-agent";
+import { keyHint, type ExtensionAPI, type ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { SignatureHelp, WorkspaceEdit, CodeAction, Command } from "vscode-languageserver-protocol";
 import { getOrCreateManager, shutdownManager, formatDiagnostic, filterDiagnosticsBySeverity, uriToPath, resolvePosition, type SeverityFilter } from "./lsp-core.js";
+import { formatBoundedDiagnostics, TOOL_DIAGNOSTIC_BUDGET } from "./diagnostic-output.js";
 
 const PREVIEW_LINES = 10;
+const PREVIEW_LINE_CHARS = 80;
 const DIAGNOSTICS_WAIT_MS_DEFAULT = 3000;
+
+function truncatePreviewLine(line: string): string {
+  if (line.length <= PREVIEW_LINE_CHARS) return line;
+  return `${line.slice(0, PREVIEW_LINE_CHARS - 1).trimEnd()}…`;
+}
 
 function styleToolResultLine(line: string, theme: Parameters<NonNullable<ToolDefinition["renderResult"]>>[2]): string {
   if (/^(ERROR|FATAL)\b/i.test(line)) return theme.fg("error", line);
@@ -312,14 +319,23 @@ Use find/grep or bash to locate files before querying LSP positions.`,
           case "diagnostics": {
             const result = await abortable(manager.touchFileAndWait(file!, diagnosticsWaitMsForFile(file!)), signal);
             const filtered = filterDiagnosticsBySeverity(result.diagnostics, sevFilter);
+            const displayFile = ctx?.cwd && path.isAbsolute(file!) ? path.relative(ctx.cwd, file!) : file!;
             const body = result.unsupported
               ? `Unsupported: ${result.error || "No LSP for this file."}`
               : !result.receivedResponse
                 ? "Timeout: LSP server did not respond. Try again."
                 : filtered.length
-                  ? filtered.map(formatDiagnostic).join("\n")
+                  ? formatBoundedDiagnostics(displayFile, filtered, TOOL_DIAGNOSTIC_BUDGET, { includeHeader: false })
                   : "No diagnostics.";
-            return { content: [{ type: "text", text: `${sevLine}${body}` }], details: { ...result, diagnostics: filtered } };
+            return {
+              content: [{ type: "text", text: `${sevLine}${body}` }],
+              details: {
+                ...result,
+                diagnostics: filtered.slice(0, TOOL_DIAGNOSTIC_BUDGET.maxDiagnostics),
+                diagnosticCount: filtered.length,
+                diagnosticsTruncated: filtered.length > TOOL_DIAGNOSTIC_BUDGET.maxDiagnostics,
+              },
+            };
           }
           case "workspace-diagnostics": {
             if (!normalizedFiles?.length) throw new Error('Action "workspace-diagnostics" requires a "files" array.');
@@ -349,7 +365,18 @@ Use find/grep or bash to locate files before querying LSP positions.`,
             }
 
             const summary = `Analyzed ${result.items.length} file(s): ${errors} error(s), ${warnings} warning(s) in ${filesWithIssues} file(s)`;
-            return { content: [{ type: "text", text: `action: workspace-diagnostics\n${sevLine}${summary}\n\n${out.length ? out.join("\n") : "No diagnostics."}` }], details: result };
+            const body = out.length ? out.join("\n") : "No diagnostics.";
+            const bounded = body.length > TOOL_DIAGNOSTIC_BUDGET.maxTotalChars ? `${body.slice(0, TOOL_DIAGNOSTIC_BUDGET.maxTotalChars - 31).trimEnd()}\nDiagnostic output truncated.` : body;
+            const boundedDetails = {
+              ...result,
+              items: result.items.map((item) => ({
+                ...item,
+                diagnostics: item.diagnostics?.slice(0, TOOL_DIAGNOSTIC_BUDGET.maxDiagnostics),
+                diagnosticCount: item.diagnostics?.length ?? 0,
+                diagnosticsTruncated: (item.diagnostics?.length ?? 0) > TOOL_DIAGNOSTIC_BUDGET.maxDiagnostics,
+              })),
+            };
+            return { content: [{ type: "text", text: `action: workspace-diagnostics\n${sevLine}${summary}\n\n${bounded}` }], details: boundedDetails };
           }
           case "signature": {
             const result = await abortable(manager.getSignatureHelp(file!, rLine!, rCol!), signal);
@@ -387,7 +414,6 @@ Use find/grep or bash to locate files before querying LSP positions.`,
       else if (params.files?.length) text += " " + theme.fg("muted", `${params.files.length} file(s)`);
       if (params.query) text += " " + theme.fg("dim", `query="${params.query}"`);
       else if (params.line !== undefined && params.column !== undefined) text += theme.fg("warning", `:${params.line}:${params.column}`);
-      if (params.severity && params.severity !== "all") text += " " + theme.fg("dim", `[${params.severity}]`);
       return new Text(text, 0, 0);
     },
 
@@ -412,9 +438,13 @@ Use find/grep or bash to locate files before querying LSP positions.`,
       let out = header.map((l: string) => theme.fg("muted", l)).join("\n");
       if (display.length) {
         if (out) out += "\n";
-        out += display.map((l: string) => styleToolResultLine(l, theme)).join("\n");
+        out += display.map((l: string) => styleToolResultLine(options.expanded ? l : truncatePreviewLine(l), theme)).join("\n");
       }
-      if (remaining > 0) out += theme.fg("dim", `\n... (${remaining} more lines)`);
+      if (remaining > 0) {
+        out += options.expanded
+          ? theme.fg("dim", `\n(${keyHint("app.tools.expand", "to collapse")})`)
+          : theme.fg("dim", `\n... (${remaining} more lines, ${keyHint("app.tools.expand", "to expand")})`);
+      }
 
       return new Text(out, 0, 0);
     },
