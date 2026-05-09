@@ -109,4 +109,58 @@ describe("LSP binary resolution", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("outside-cwd file with its own project root is detected", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lsp-sibling-root-"));
+    const cwd = path.join(dir, "cwd");
+    const sibling = path.join(dir, "sibling");
+    const cache = path.join(dir, "cache");
+    const global = path.join(dir, "global");
+
+    // cwd has no package.json — empty shell
+    fs.mkdirSync(cwd, { recursive: true });
+
+    // sibling has its own package.json and a .ts file
+    fs.mkdirSync(sibling, { recursive: true });
+    fs.writeFileSync(path.join(sibling, "package.json"), "{}\n");
+    const file = path.join(sibling, "index.ts");
+    fs.writeFileSync(file, "export const x = 1;\n");
+
+    // Put a binary in the sibling project-local node_modules
+    const projectBin = path.join(sibling, "node_modules", ".bin", "typescript-language-server");
+    touchExecutable(projectBin);
+
+    try {
+      withResolutionEnv(cache, global, () => {
+        const info = inspectLspForFile(cwd, file);
+        expect(info.status).toBe("ok");
+        expect(info.root).toBe(sibling);
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("outside-cwd file without any project root reports unsupported", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lsp-orphan-"));
+    const cwd = path.join(dir, "cwd");
+    const orphan = path.join(dir, "orphan");
+    const cache = path.join(dir, "cache");
+    const global = path.join(dir, "global");
+
+    fs.mkdirSync(cwd, { recursive: true });
+    fs.mkdirSync(orphan, { recursive: true });
+    const file = path.join(orphan, "index.ts");
+    fs.writeFileSync(file, "export const x = 1;\n");
+
+    try {
+      withResolutionEnv(cache, global, () => {
+        const info = inspectLspForFile(cwd, file);
+        expect(info.status).toBe("unsupported");
+        expect(info.reason).toContain("No JS/TS project root detected");
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

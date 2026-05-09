@@ -168,17 +168,32 @@ function isPathInsideOrEqual(child: string, parent: string): boolean {
 function findNearestFile(startDir: string, targets: string[], stopDir: string): string | undefined {
   let current = path.resolve(startDir);
   const stop = path.resolve(stopDir);
-  if (!isPathInsideOrEqual(current, stop)) return undefined;
 
-  while (isPathInsideOrEqual(current, stop)) {
-    for (const t of targets) {
-      const candidate = path.join(current, t);
-      if (fs.existsSync(candidate)) return candidate;
+  if (isPathInsideOrEqual(current, stop)) {
+    // Inside or equal to cwd: walk up but stop at cwd boundary.
+    while (isPathInsideOrEqual(current, stop)) {
+      for (const t of targets) {
+        const candidate = path.join(current, t);
+        if (fs.existsSync(candidate)) return candidate;
+      }
+      if (current === stop) break;
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
     }
-    if (current === stop) break;
-    const parent = path.dirname(current);
-    if (parent === current) break;
-    current = parent;
+  } else {
+    // Outside cwd: walk up from the file's directory toward filesystem root.
+    // Use a depth cap to avoid runaway traversal on very deep trees.
+    const MAX_DEPTH = 20;
+    for (let depth = 0; depth < MAX_DEPTH; depth++) {
+      for (const t of targets) {
+        const candidate = path.join(current, t);
+        if (fs.existsSync(candidate)) return candidate;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
   }
 }
 
