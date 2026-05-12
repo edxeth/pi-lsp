@@ -29,16 +29,39 @@ const PREVIEW_LINES = 10;
 const PREVIEW_LINE_CHARS = 80;
 const DIAGNOSTICS_WAIT_MS_DEFAULT = 3000;
 
-function truncatePreviewLine(line: string): string {
-  if (line.length <= PREVIEW_LINE_CHARS) return line;
-  return `${line.slice(0, PREVIEW_LINE_CHARS - 1).trimEnd()}…`;
+function wrapPreviewLine(line: string): string[] {
+  if (line.length <= PREVIEW_LINE_CHARS) return [line];
+  const chunks: string[] = [];
+  let rest = line;
+  while (rest.length > PREVIEW_LINE_CHARS) {
+    const breakAt = Math.max(rest.lastIndexOf(" ", PREVIEW_LINE_CHARS), PREVIEW_LINE_CHARS);
+    chunks.push(rest.slice(0, breakAt).trimEnd());
+    rest = rest.slice(breakAt).trimStart();
+  }
+  if (rest) chunks.push(rest);
+  return chunks;
 }
 
-function styleToolResultLine(line: string, theme: Parameters<NonNullable<ToolDefinition["renderResult"]>>[2]): string {
-  if (/^(ERROR|FATAL)\b/i.test(line)) return theme.fg("error", line);
-  if (/^(WARN|WARNING)\b/i.test(line) || /^(Unsupported|Timeout|LSP unavailable)\b/i.test(line)) return theme.fg("warning", line);
-  if (/^INFO\b/i.test(line)) return theme.fg("muted", line);
-  if (/^HINT\b/i.test(line)) return theme.fg("dim", line);
+function previewContentLines(lines: string[], maxLines: number): { lines: Array<{ text: string; source: string }>; remaining: number } {
+  const preview: Array<{ text: string; source: string }> = [];
+  let total = 0;
+
+  for (const line of lines) {
+    const wrapped = wrapPreviewLine(line);
+    total += wrapped.length;
+    for (const text of wrapped) {
+      if (preview.length < maxLines) preview.push({ text, source: line });
+    }
+  }
+
+  return { lines: preview, remaining: Math.max(0, total - preview.length) };
+}
+
+function styleToolResultLine(line: string, theme: Parameters<NonNullable<ToolDefinition["renderResult"]>>[2], source = line): string {
+  if (/^(ERROR|FATAL)\b/i.test(source)) return theme.fg("error", line);
+  if (/^(WARN|WARNING)\b/i.test(source) || /^(Unsupported|Timeout|LSP unavailable)\b/i.test(source)) return theme.fg("warning", line);
+  if (/^INFO\b/i.test(source)) return theme.fg("muted", line);
+  if (/^HINT\b/i.test(source)) return theme.fg("dim", line);
   return theme.fg("toolOutput", line);
 }
 
@@ -55,6 +78,10 @@ function diagnosticsWaitMsForFile(filePath: string): number {
   if (ext === ".go") return 8000;
   if (ext === ".rs") return 20000;
   return DIAGNOSTICS_WAIT_MS_DEFAULT;
+}
+
+function toolDiagnosticsWaitMsForFile(filePath: string): number {
+  return Math.max(diagnosticsWaitMsForFile(filePath), 10000);
 }
 
 const ACTIONS = ["definition", "references", "hover", "symbols", "diagnostics", "workspace-diagnostics", "signature", "rename", "codeAction", "restart"] as const;
@@ -317,7 +344,7 @@ Use find/grep or bash to locate files before querying LSP positions.`,
             return { content: [{ type: "text", text: `action: symbols\n${qLine}${payload}` }], details: symbols };
           }
           case "diagnostics": {
-            const result = await abortable(manager.touchFileAndWait(file!, diagnosticsWaitMsForFile(file!)), signal);
+            const result = await abortable(manager.touchFileAndWait(file!, toolDiagnosticsWaitMsForFile(file!)), signal);
             const filtered = filterDiagnosticsBySeverity(result.diagnostics, sevFilter);
             const displayFile = ctx?.cwd && path.isAbsolute(file!) ? path.relative(ctx.cwd, file!) : file!;
             const body = result.unsupported
@@ -329,6 +356,7 @@ Use find/grep or bash to locate files before querying LSP positions.`,
                   : "No diagnostics.";
             return {
               content: [{ type: "text", text: `${sevLine}${body}` }],
+              isError: !result.unsupported && !result.receivedResponse,
               details: {
                 ...result,
                 diagnostics: filtered.slice(0, TOOL_DIAGNOSTIC_BUDGET.maxDiagnostics),
@@ -339,7 +367,7 @@ Use find/grep or bash to locate files before querying LSP positions.`,
           }
           case "workspace-diagnostics": {
             if (!normalizedFiles?.length) throw new Error('Action "workspace-diagnostics" requires a "files" array.');
-            const waitMs = Math.max(...normalizedFiles.map(diagnosticsWaitMsForFile));
+            const waitMs = Math.max(...normalizedFiles.map(toolDiagnosticsWaitMsForFile));
             const result = await abortable(manager.getDiagnosticsForFiles(normalizedFiles, waitMs), signal);
             const out: string[] = [];
             let errors = 0,
@@ -367,6 +395,7 @@ Use find/grep or bash to locate files before querying LSP positions.`,
             const summary = `Analyzed ${result.items.length} file(s): ${errors} error(s), ${warnings} warning(s) in ${filesWithIssues} file(s)`;
             const body = out.length ? out.join("\n") : "No diagnostics.";
             const bounded = body.length > TOOL_DIAGNOSTIC_BUDGET.maxTotalChars ? `${body.slice(0, TOOL_DIAGNOSTIC_BUDGET.maxTotalChars - 31).trimEnd()}\nDiagnostic output truncated.` : body;
+            const hasTimeout = result.items.some((item) => item.status === "timeout");
             const boundedDetails = {
               ...result,
               items: result.items.map((item) => ({
@@ -376,7 +405,7 @@ Use find/grep or bash to locate files before querying LSP positions.`,
                 diagnosticsTruncated: (item.diagnostics?.length ?? 0) > TOOL_DIAGNOSTIC_BUDGET.maxDiagnostics,
               })),
             };
-            return { content: [{ type: "text", text: `action: workspace-diagnostics\n${sevLine}${summary}\n\n${bounded}` }], details: boundedDetails };
+            return { content: [{ type: "text", text: `action: workspace-diagnostics\n${sevLine}${summary}\n\n${bounded}` }], details: boundedDetails, isError: hasTimeout };
           }
           case "signature": {
             const result = await abortable(manager.getSignatureHelp(file!, rLine!, rCol!), signal);
@@ -431,16 +460,18 @@ Use find/grep or bash to locate files before querying LSP positions.`,
 
       const header = lines.slice(0, headerEnd);
       const content = lines.slice(headerEnd);
-      const maxLines = options.expanded ? content.length : PREVIEW_LINES;
-      const display = content.slice(0, maxLines);
-      const remaining = content.length - maxLines;
+      const contentPreviewLines = Math.max(0, PREVIEW_LINES - header.length);
+      const preview = options.expanded
+        ? { lines: content.map((line) => ({ text: line, source: line })), remaining: 0 }
+        : previewContentLines(content, contentPreviewLines);
 
       let out = header.map((l: string) => theme.fg("muted", l)).join("\n");
-      if (display.length) {
+      if (preview.lines.length) {
         if (out) out += "\n";
-        out += display.map((l: string) => styleToolResultLine(options.expanded ? l : truncatePreviewLine(l), theme)).join("\n");
+        out += preview.lines.map(({ text, source }) => styleToolResultLine(text, theme, source)).join("\n");
       }
-      if (remaining > 0) {
+      if (preview.remaining > 0) {
+        const remaining = preview.remaining;
         out += options.expanded
           ? theme.fg("dim", `\n(${keyHint("app.tools.expand", "to collapse")})`)
           : theme.fg("dim", `\n... (${remaining} more lines, ${keyHint("app.tools.expand", "to expand")})`);
