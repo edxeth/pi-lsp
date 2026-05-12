@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { resolvePiPaths } from "../src/lsp-paths.js";
 import { buildInstallPlan, buildNodeInstallCommand, formatRepairBlock, parseNpmCommand } from "../src/lsp-installer.js";
-import { getRegistryEntry } from "../src/lsp-registry.js";
+import { AUTO_INSTALLABLE_SERVER_IDS, getRegistryEntry, getRepairHint } from "../src/lsp-registry.js";
 
 describe("Pi path resolution", () => {
   test("defaults to the standard Pi cache location", () => {
@@ -60,5 +60,11 @@ describe("LSP installer registry", () => {
     expect(block).toContain("Repair available:");
     expect(block).toContain("/lsp-install pyright");
     expect(block).toContain("pyright");
+  });
+
+  test("registry separates auto-installable servers from manual install hints", () => {
+    expect(AUTO_INSTALLABLE_SERVER_IDS).toContain("typescript");
+    expect(AUTO_INSTALLABLE_SERVER_IDS).not.toContain("rust-analyzer");
+    expect(getRepairHint("rust-analyzer")).toContain("rustup component add rust-analyzer");
   });
 });

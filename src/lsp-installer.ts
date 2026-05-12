@@ -58,7 +58,7 @@ export function parseNpmCommand(value: unknown): string[] | undefined {
   return undefined;
 }
 
-export function readConfiguredNpmCommand(settingsPath = resolvePiPaths().settingsPath): string[] | undefined {
+function readConfiguredNpmCommand(settingsPath = resolvePiPaths().settingsPath): string[] | undefined {
   try {
     if (!fs.existsSync(settingsPath)) return undefined;
     const parsed = JSON.parse(fs.readFileSync(settingsPath, "utf-8")) as Record<string, unknown>;

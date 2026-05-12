@@ -6,7 +6,7 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { resolvePiPaths } from "./lsp-paths.js";
-import { LANGUAGE_IDS, getRegistryEntry } from "./lsp-registry.js";
+import { LANGUAGE_IDS, LSP_REGISTRY, getRegistryEntry, type LspRegistryEntry } from "./lsp-registry.js";
 import {
   createMessageConnection,
   StreamMessageReader,
@@ -52,12 +52,68 @@ const MAX_OPEN_FILES = 30;
 const IDLE_TIMEOUT_MS = 60_000;
 const CLEANUP_INTERVAL_MS = 30_000;
 
+export class LspConnectionClosedError extends Error {
+  constructor(
+    readonly serverId: string,
+    readonly root: string,
+    message = `LSP connection closed for ${serverId} at ${root}`
+  ) {
+    super(message);
+    this.name = "LspConnectionClosedError";
+  }
+}
+
+export class LspProcessExitedError extends Error {
+  constructor(
+    readonly serverId: string,
+    readonly root: string,
+    readonly exitCode: number | null,
+    readonly stderrTail = ""
+  ) {
+    super(`LSP process ${serverId} at ${root} exited with code ${exitCode}${stderrTail ? `; stderr tail: ${stderrTail}` : ""}`);
+    this.name = "LspProcessExitedError";
+  }
+}
+
+export function isLspDeadConnectionError(error: unknown): boolean {
+  return error instanceof LspConnectionClosedError || error instanceof LspProcessExitedError;
+}
+
 // Types
 interface LSPServerConfig {
   id: string;
   extensions: string[];
   findRoot: (file: string, cwd: string) => string | undefined;
   spawn: (root: string) => Promise<{ process: ChildProcessWithoutNullStreams; initOptions?: Record<string, unknown> } | undefined>;
+  command?: string[];
+  env?: Record<string, string>;
+}
+
+interface CustomServerConfig {
+  command?: string[];
+  extensions?: string[];
+  disabled?: boolean;
+  env?: Record<string, string>;
+  initialization?: Record<string, unknown>;
+}
+
+interface CustomLspConfig {
+  lsp?: Record<string, CustomServerConfig>;
+}
+
+function readJsonFile<T>(filePath: string): T | undefined {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf-8")) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+function loadCustomServerConfig(cwd: string): Record<string, CustomServerConfig> {
+  const userConfigDir = process.env.PI_CODING_AGENT_DIR || (process.env.HOME ? path.join(process.env.HOME, ".pi") : undefined);
+  const userConfig = userConfigDir ? readJsonFile<CustomLspConfig>(path.join(userConfigDir, "lsp-client.json"))?.lsp : undefined;
+  const projectConfig = readJsonFile<CustomLspConfig>(path.join(cwd, ".pi", "lsp-client.json"))?.lsp;
+  return { ...(userConfig ?? {}), ...(projectConfig ?? {}) };
 }
 
 export interface LspInspection {
@@ -73,6 +129,7 @@ export interface LspInspection {
 interface OpenFile {
   version: number;
   lastAccess: number;
+  text: string;
 }
 
 interface LSPClient {
@@ -88,7 +145,15 @@ interface LSPClient {
   closed: boolean;
 }
 
-export interface FileDiagnosticItem {
+export interface LspClientSnapshot {
+  root: string;
+  serverId: string;
+  openFiles: number;
+  alive: boolean;
+  command: string[];
+}
+
+interface FileDiagnosticItem {
   file: string;
   diagnostics: Diagnostic[];
   status: "ok" | "timeout" | "error" | "unsupported";
@@ -136,6 +201,10 @@ function firstDefined(...items: (string | undefined)[]): string | undefined {
   return items.find((item): item is string => !!item);
 }
 
+function resolveCommandBinary(root: string, cmd: string): string | undefined {
+  return path.isAbsolute(cmd) ? (fs.existsSync(cmd) ? cmd : undefined) : projectBin(root, cmd) || cachedBin(cmd) || globalBin(cmd);
+}
+
 function globalBin(cmd: string): string | undefined {
   return findExecutableInDirs(cmd, globalSearchPaths());
 }
@@ -165,6 +234,17 @@ function isPathInsideOrEqual(child: string, parent: string): boolean {
   return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
+function findMarkerInDir(dir: string, target: string): string | undefined {
+  if (!target.includes("*")) {
+    const candidate = path.join(dir, target);
+    return fs.existsSync(candidate) ? candidate : undefined;
+  }
+  if (!fs.existsSync(dir)) return undefined;
+  const pattern = new RegExp(`^${target.split("*").map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`);
+  const match = fs.readdirSync(dir).find((name) => pattern.test(name));
+  return match ? path.join(dir, match) : undefined;
+}
+
 function findNearestFile(startDir: string, targets: string[], stopDir: string): string | undefined {
   let current = path.resolve(startDir);
   const stop = path.resolve(stopDir);
@@ -173,8 +253,8 @@ function findNearestFile(startDir: string, targets: string[], stopDir: string): 
     // Inside or equal to cwd: walk up but stop at cwd boundary.
     while (isPathInsideOrEqual(current, stop)) {
       for (const t of targets) {
-        const candidate = path.join(current, t);
-        if (fs.existsSync(candidate)) return candidate;
+        const marker = findMarkerInDir(current, t);
+        if (marker) return marker;
       }
       if (current === stop) break;
       const parent = path.dirname(current);
@@ -187,8 +267,8 @@ function findNearestFile(startDir: string, targets: string[], stopDir: string): 
     const MAX_DEPTH = 20;
     for (let depth = 0; depth < MAX_DEPTH; depth++) {
       for (const t of targets) {
-        const candidate = path.join(current, t);
-        if (fs.existsSync(candidate)) return candidate;
+        const marker = findMarkerInDir(current, t);
+        if (marker) return marker;
       }
       const parent = path.dirname(current);
       if (parent === current) break;
@@ -218,12 +298,18 @@ function timeout<T>(promise: Promise<T>, ms: number, name: string): Promise<T> {
   });
 }
 
-function simpleSpawn(bin: string, args: string[] = ["--stdio"]) {
+function spawnCommand(command: string[], env?: Record<string, string>) {
   return async (root: string) => {
-    const cmd = projectBin(root, bin) || which(bin);
+    const [bin, ...args] = command;
+    if (!bin) return undefined;
+    const cmd = resolveCommandBinary(root, bin);
     if (!cmd) return undefined;
-    return { process: spawn(cmd, args, { cwd: root, stdio: ["pipe", "pipe", "pipe"] }) };
+    return { process: spawn(cmd, args, { cwd: root, stdio: ["pipe", "pipe", "pipe"], env: env ? { ...process.env, ...env } : process.env }) };
   };
+}
+
+function simpleSpawn(bin: string, args: string[] = ["--stdio"]) {
+  return spawnCommand([bin, ...args]);
 }
 
 async function spawnChecked(cmd: string, args: string[], cwd: string): Promise<ChildProcessWithoutNullStreams | undefined> {
@@ -260,6 +346,15 @@ async function spawnChecked(cmd: string, args: string[], cwd: string): Promise<C
   } catch {
     return undefined;
   }
+}
+
+function detectConfiguredServerBinary(config: LSPServerConfig, root: string): string | undefined {
+  if (config.command?.length) {
+    const bin = config.command[0];
+    if (!bin) return undefined;
+    return resolveCommandBinary(root, bin);
+  }
+  return detectServerBinary(config.id, root);
 }
 
 function detectServerBinary(serverId: string, root: string): string | undefined {
@@ -361,12 +456,12 @@ export function inspectLspForFile(cwd: string, filePath: string): LspInspection 
   const absPath = normalizeFsPath(path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath));
   const ext = path.extname(absPath);
 
-  for (const config of LSP_SERVERS) {
+  for (const config of lspServersFor(cwd)) {
     if (!serverMatchesFile(config, absPath)) continue;
     const root = config.findRoot(absPath, cwd);
     if (!root) continue;
 
-    const binary = detectServerBinary(config.id, root);
+    const binary = detectConfiguredServerBinary(config, root);
     if (binary) {
       return { file: absPath, ext, serverId: config.id, root, binary, status: "ok" };
     }
@@ -526,6 +621,53 @@ export const LSP_SERVERS: LSPServerConfig[] = [
   },
 ];
 
+const SPECIAL_SERVER_IDS = new Set(LSP_SERVERS.map((server) => server.id));
+
+function findRuntimeRoot(file: string, cwd: string, entry: LspRegistryEntry): string | undefined {
+  if (entry.runtime?.rootStrategy === "cwd") return isPathInsideOrEqual(file, cwd) ? cwd : undefined;
+  const markers = entry.runtime?.rootMarkers;
+  if (!markers?.length) return isPathInsideOrEqual(file, cwd) ? cwd : undefined;
+  return findRoot(file, cwd, markers);
+}
+
+function registryRuntimeServerConfigs(): LSPServerConfig[] {
+  return LSP_REGISTRY.filter((entry) => entry.runtime && !SPECIAL_SERVER_IDS.has(entry.id)).map((entry) => ({
+    id: entry.id,
+    extensions: entry.extensions,
+    findRoot: (file, cwd) => findRuntimeRoot(file, cwd, entry),
+    command: entry.runtime!.command,
+    spawn: spawnCommand(entry.runtime!.command),
+  }));
+}
+
+function customServerConfigs(cwd: string): LSPServerConfig[] {
+  const configured = loadCustomServerConfig(cwd);
+  const servers: LSPServerConfig[] = [];
+
+  for (const [id, entry] of Object.entries(configured)) {
+    if (entry.disabled || !entry.command?.length || !entry.extensions?.length) continue;
+    servers.push({
+      id,
+      extensions: entry.extensions,
+      findRoot: (file, rootCwd) => (isPathInsideOrEqual(file, rootCwd) ? rootCwd : undefined),
+      command: entry.command,
+      env: entry.env,
+      spawn: async (root) => {
+        const spawned = await spawnCommand(entry.command!, entry.env)(root);
+        return spawned ? { ...spawned, initOptions: entry.initialization } : undefined;
+      },
+    });
+  }
+
+  return servers;
+}
+
+function lspServersFor(cwd: string): LSPServerConfig[] {
+  const configured = loadCustomServerConfig(cwd);
+  const disabled = new Set(Object.entries(configured).filter(([, entry]) => entry.disabled).map(([id]) => id));
+  return [...customServerConfigs(cwd), ...LSP_SERVERS.filter((server) => !disabled.has(server.id)), ...registryRuntimeServerConfigs().filter((server) => !disabled.has(server.id))];
+}
+
 // Manager registry. Keep managers scoped by cwd so two sessions in one process do not
 // accidentally tear down each other's language servers.
 const managers = new Map<string, LSPManager>();
@@ -542,11 +684,6 @@ export function getOrCreateManager(cwd: string): LSPManager {
   const manager = new LSPManager(key);
   managers.set(key, manager);
   return manager;
-}
-
-export function getManager(cwd?: string): LSPManager | null {
-  if (cwd) return managers.get(managerKey(cwd)) ?? null;
-  return managers.values().next().value ?? null;
 }
 
 export async function shutdownManager(cwd?: string): Promise<void> {
@@ -628,13 +765,52 @@ export class LSPManager {
   }
 
   private async lspRequest<T>(client: LSPClient, request: unknown, params: unknown, name: string, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
-    return timeout(client.connection.sendRequest(request as never, params as never) as Promise<T>, timeoutMs, name);
+    const k = this.key(client.serverId, client.root);
+    if (client.closed) {
+      this.recordFailure(k, `${client.serverId} language server connection is closed.`, client.stderr);
+      throw new LspConnectionClosedError(client.serverId, client.root);
+    }
+    if (client.process.exitCode !== null) {
+      const error = new LspProcessExitedError(client.serverId, client.root, client.process.exitCode, client.stderr.slice(-20).join("\n"));
+      this.recordFailure(k, error.message, client.stderr);
+      client.closed = true;
+      this.clients.delete(k);
+      throw error;
+    }
+
+    let cleanupExitListener: (() => void) | undefined;
+    try {
+      const processExit = new Promise<never>((_resolve, reject) => {
+        const onExit = () => {
+          cleanupExitListener?.();
+          reject(new LspProcessExitedError(client.serverId, client.root, client.process.exitCode, client.stderr.slice(-20).join("\n")));
+        };
+        cleanupExitListener = () => client.process.off("exit", onExit);
+        client.process.once("exit", onExit);
+      });
+      return await timeout(Promise.race([client.connection.sendRequest(request as never, params as never) as Promise<T>, processExit]), timeoutMs, name);
+    } catch (error) {
+      if (client.closed) {
+        this.recordFailure(k, `${client.serverId} language server connection closed during ${name}.`, client.stderr);
+        throw new LspConnectionClosedError(client.serverId, client.root);
+      }
+      if (client.process.exitCode !== null) {
+        const exited = new LspProcessExitedError(client.serverId, client.root, client.process.exitCode, client.stderr.slice(-20).join("\n"));
+        this.recordFailure(k, exited.message, client.stderr);
+        client.closed = true;
+        this.clients.delete(k);
+        throw exited;
+      }
+      throw error;
+    } finally {
+      cleanupExitListener?.();
+    }
   }
 
   describeUnavailableForFile(filePath: string): string | undefined {
     const absPath = this.resolve(filePath);
 
-    for (const config of LSP_SERVERS) {
+    for (const config of lspServersFor(this.cwd)) {
       if (!serverMatchesFile(config, absPath)) continue;
       const root = config.findRoot(absPath, this.cwd);
       if (!root) return this.explainNoLsp(absPath);
@@ -802,7 +978,7 @@ export class LSPManager {
     const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(this.cwd, filePath);
     const clients: LSPClient[] = [];
 
-    for (const config of LSP_SERVERS) {
+    for (const config of lspServersFor(this.cwd)) {
       if (!serverMatchesFile(config, absPath)) continue;
       const root = config.findRoot(absPath, this.cwd);
       if (!root) continue;
@@ -887,7 +1063,7 @@ export class LSPManager {
       try {
         if (state) {
           const v = state.version + 1;
-          client.openFiles.set(absPath, { version: v, lastAccess: now });
+          client.openFiles.set(absPath, { version: v, lastAccess: now, text: content });
           void client.connection
             .sendNotification(DidChangeTextDocumentNotification.type, {
               textDocument: { uri, version: v },
@@ -895,16 +1071,10 @@ export class LSPManager {
             })
             .catch(() => {});
         } else {
-          client.openFiles.set(absPath, { version: 1, lastAccess: now });
+          client.openFiles.set(absPath, { version: 0, lastAccess: now, text: content });
           void client.connection
             .sendNotification(DidOpenTextDocumentNotification.type, {
               textDocument: { uri, languageId: langId, version: 0, text: content },
-            })
-            .catch(() => {});
-          void client.connection
-            .sendNotification(DidChangeTextDocumentNotification.type, {
-              textDocument: { uri, version: 1 },
-              contentChanges: [{ text: content }],
             })
             .catch(() => {});
           if (evict) this.evictLRU(client);
@@ -959,7 +1129,7 @@ export class LSPManager {
         const current = client.diagnostics.get(absPath);
         if (current && current.length > 0) {
           if (settleTimer) clearTimeout(settleTimer);
-          settleTimer = setTimeout(() => finish(true), 150);
+          settleTimer = setTimeout(() => finish(true), 50);
           return;
         }
 
@@ -1036,6 +1206,13 @@ export class LSPManager {
       return { diagnostics: [], receivedResponse: false, unsupported: true, error: "Could not read file" };
     }
 
+    const cachedDiagnostics = clients
+      .filter((c) => c.openFiles.get(absPath)?.text === content && c.diagnostics.has(absPath))
+      .flatMap((c) => c.diagnostics.get(absPath) ?? []);
+    if (cachedDiagnostics.length || clients.some((c) => c.openFiles.get(absPath)?.text === content && c.diagnostics.has(absPath))) {
+      return { diagnostics: cachedDiagnostics, receivedResponse: true };
+    }
+
     const uri = pathToFileURL(absPath).href;
     const langId = this.langId(absPath);
     for (const c of clients) c.diagnostics.delete(absPath);
@@ -1052,18 +1229,20 @@ export class LSPManager {
     }
     if (!responded && clients.some((c) => c.diagnostics.has(absPath))) responded = true;
 
-    const pulled = await Promise.all(clients.map((c) => this.pullDiagnostics(c, absPath, uri)));
-    const pulledDiags: Diagnostic[] = [];
-    let pulledResponded = false;
-    for (let i = 0; i < clients.length; i++) {
-      const r = pulled[i];
-      if (!r.responded) continue;
-      pulledResponded = true;
-      responded = true;
-      clients[i].diagnostics.set(absPath, r.diagnostics);
-      pulledDiags.push(...r.diagnostics);
+    if (!responded) {
+      const pulled = await Promise.all(clients.map((c) => this.pullDiagnostics(c, absPath, uri)));
+      const pulledDiags: Diagnostic[] = [];
+      let pulledResponded = false;
+      for (let i = 0; i < clients.length; i++) {
+        const r = pulled[i];
+        if (!r.responded) continue;
+        pulledResponded = true;
+        responded = true;
+        clients[i].diagnostics.set(absPath, r.diagnostics);
+        pulledDiags.push(...r.diagnostics);
+      }
+      if (pulledResponded) diags = pulledDiags;
     }
-    if (pulledResponded) diags = pulledDiags;
 
     return { diagnostics: diags, receivedResponse: responded };
   }
@@ -1098,6 +1277,14 @@ export class LSPManager {
         continue;
       }
 
+      const cachedDiagnostics = clients
+        .filter((c) => c.openFiles.get(absPath)?.text === content && c.diagnostics.has(absPath))
+        .flatMap((c) => c.diagnostics.get(absPath) ?? []);
+      if (cachedDiagnostics.length || clients.some((c) => c.openFiles.get(absPath)?.text === content && c.diagnostics.has(absPath))) {
+        results.push({ file: absPath, diagnostics: cachedDiagnostics, status: "ok" });
+        continue;
+      }
+
       const uri = pathToFileURL(absPath).href;
       const langId = this.langId(absPath);
       for (const c of clients) c.diagnostics.delete(absPath);
@@ -1121,18 +1308,20 @@ export class LSPManager {
 
       let responded = waitResults.some((r) => r) || diags.length > 0;
 
-      const pulled = await Promise.all(clients.map((c) => this.pullDiagnostics(c, absPath, uri)));
-      const pulledDiags: Diagnostic[] = [];
-      let pulledResponded = false;
-      for (let i = 0; i < clients.length; i++) {
-        const r = pulled[i];
-        if (!r.responded) continue;
-        pulledResponded = true;
-        responded = true;
-        clients[i].diagnostics.set(absPath, r.diagnostics);
-        pulledDiags.push(...r.diagnostics);
+      if (!responded) {
+        const pulled = await Promise.all(clients.map((c) => this.pullDiagnostics(c, absPath, uri)));
+        const pulledDiags: Diagnostic[] = [];
+        let pulledResponded = false;
+        for (let i = 0; i < clients.length; i++) {
+          const r = pulled[i];
+          if (!r.responded) continue;
+          pulledResponded = true;
+          responded = true;
+          clients[i].diagnostics.set(absPath, r.diagnostics);
+          pulledDiags.push(...r.diagnostics);
+        }
+        if (pulledResponded) diags = pulledDiags;
       }
-      if (pulledResponded) diags = pulledDiags;
 
       if (!responded && !diags.length) {
         results.push({ file: absPath, diagnostics: [], status: "timeout", error: "LSP did not respond" });
@@ -1298,6 +1487,18 @@ export class LSPManager {
     return true;
   }
 
+  getSnapshot(): LspClientSnapshot[] {
+    return Array.from(this.clients.values())
+      .map((client) => ({
+        root: client.root,
+        serverId: client.serverId,
+        openFiles: client.openFiles.size,
+        alive: !client.closed && client.process.exitCode === null,
+        command: client.process.spawnargs ?? [],
+      }))
+      .sort((a, b) => `${a.serverId}:${a.root}`.localeCompare(`${b.serverId}:${b.root}`));
+  }
+
   async shutdown() {
     if (this.closed) return;
     this.closed = true;
@@ -1338,10 +1539,9 @@ export class LSPManager {
 }
 
 // Diagnostic Formatting
-export { DiagnosticSeverity };
 export type SeverityFilter = "all" | "error" | "warning" | "info" | "hint";
 
-export function diagnosticSeverityLabel(severity: Diagnostic["severity"]): string {
+function diagnosticSeverityLabel(severity: Diagnostic["severity"]): string {
   return severity === 1 ? "ERROR" : severity === 2 ? "WARN" : severity === 3 ? "INFO" : severity === 4 ? "HINT" : "DIAG";
 }
 
@@ -1366,7 +1566,7 @@ export function uriToPath(uri: string): string {
 }
 
 // Symbol search
-export function findSymbolPosition(symbols: DocumentSymbol[], query: string): { line: number; character: number } | null {
+function findSymbolPosition(symbols: DocumentSymbol[], query: string): { line: number; character: number } | null {
   const q = query.toLowerCase();
   let exact: { line: number; character: number } | null = null;
   let partial: { line: number; character: number } | null = null;
