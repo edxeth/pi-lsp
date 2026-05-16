@@ -86,6 +86,16 @@ export const LSP_REGISTRY: LspRegistryEntry[] = [
     },
   },
   {
+    id: "pyrefly",
+    displayName: "Python / Pyrefly",
+    extensions: [".py", ".pyi"],
+    languageIds: { ".py": "python", ".pyi": "python" },
+    repair: {
+      kind: "manual",
+      hint: "Install Pyrefly with pip, uv, conda, Poetry, or Pixi and ensure the pyrefly command is on PATH.",
+    },
+  },
+  {
     id: "bash",
     displayName: "Bash Language Server",
     extensions: [".sh", ".bash", ".zsh", ".ksh"],

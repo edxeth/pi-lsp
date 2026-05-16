@@ -108,6 +108,7 @@ For many position-based actions, `query` can be used instead of an exact line/co
 | `vue` | Vue | Pi-cache npm package |
 | `svelte` | Svelte | Pi-cache npm package |
 | `pyright` | Python / Pyright | Pi-cache npm package |
+| `pyrefly` | Python / Pyrefly | manual hint |
 | `bash` | Bash / shell scripts | Pi-cache npm package |
 | `yaml-ls` | YAML | Pi-cache npm package |
 | `dockerfile` | Dockerfile | Pi-cache npm package |
@@ -191,6 +192,7 @@ Deno projects are skipped intentionally when `deno.json` or `deno.jsonc` is foun
 | Vue | `package.json`, `vite.config.ts`, `vite.config.js` |
 | Svelte | `package.json`, `svelte.config.js` |
 | Python | `pyproject.toml`, `setup.py`, `requirements.txt`, `pyrightconfig.json` |
+| Python / Pyrefly | `pyrefly.toml` |
 | Go | `go.work`, `go.mod` |
 | Rust | `Cargo.toml` |
 | Dart / Flutter | `pubspec.yaml`, `analysis_options.yaml` |

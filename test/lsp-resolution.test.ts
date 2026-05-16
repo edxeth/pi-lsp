@@ -168,27 +168,39 @@ describe("LSP binary resolution", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lsp-runtime-"));
     const astroBin = path.join(dir, "node_modules", ".bin", "astro-ls");
     const csharpBin = path.join(dir, "node_modules", ".bin", "csharp-ls");
+    const pyreflyBin = path.join(dir, "global", "pyrefly");
     const astroFile = path.join(dir, "src", "page.astro");
     const csharpFile = path.join(dir, "Program.cs");
+    const pythonFile = path.join(dir, "example.py");
 
     try {
       fs.mkdirSync(path.dirname(astroFile), { recursive: true });
       touchExecutable(astroBin);
       touchExecutable(csharpBin);
+      touchExecutable(pyreflyBin);
       fs.writeFileSync(path.join(dir, "astro.config.mjs"), "export default {};\n");
       fs.writeFileSync(path.join(dir, "App.csproj"), "<Project />\n");
+      fs.writeFileSync(path.join(dir, "pyrefly.toml"), "\n");
       fs.writeFileSync(astroFile, "---\n---\n");
       fs.writeFileSync(csharpFile, "class Program {}\n");
+      fs.writeFileSync(pythonFile, "x = 1\n");
 
-      const astro = inspectLspForFile(dir, astroFile);
-      expect(astro.status).toBe("ok");
-      expect(astro.serverId).toBe("astro");
-      expect(astro.binary).toBe(astroBin);
+      withResolutionEnv(path.join(dir, "cache"), path.dirname(pyreflyBin), () => {
+        const astro = inspectLspForFile(dir, astroFile);
+        expect(astro.status).toBe("ok");
+        expect(astro.serverId).toBe("astro");
+        expect(astro.binary).toBe(astroBin);
 
-      const csharp = inspectLspForFile(dir, csharpFile);
-      expect(csharp.status).toBe("ok");
-      expect(csharp.serverId).toBe("csharp");
-      expect(csharp.binary).toBe(csharpBin);
+        const csharp = inspectLspForFile(dir, csharpFile);
+        expect(csharp.status).toBe("ok");
+        expect(csharp.serverId).toBe("csharp");
+        expect(csharp.binary).toBe(csharpBin);
+
+        const pyrefly = inspectLspForFile(dir, pythonFile);
+        expect(pyrefly.status).toBe("ok");
+        expect(pyrefly.serverId).toBe("pyrefly");
+        expect(pyrefly.binary).toBe(pyreflyBin);
+      });
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

@@ -39,7 +39,6 @@ import {
   type WorkspaceEdit,
   type CodeAction,
   type Command,
-  DiagnosticSeverity,
   CodeActionKind,
   DocumentDiagnosticReportKind,
 } from "vscode-languageserver-protocol";
@@ -552,6 +551,13 @@ export const LSP_SERVERS: LSPServerConfig[] = [
     extensions: getRegistryEntry("svelte")?.extensions ?? [".svelte"],
     findRoot: (f, cwd) => findRoot(f, cwd, ["package.json", "svelte.config.js"]),
     spawn: simpleSpawn("svelteserver"),
+  },
+  {
+    id: "pyrefly",
+    extensions: getRegistryEntry("pyrefly")?.extensions ?? [".py", ".pyi"],
+    findRoot: (f, cwd) => findRoot(f, cwd, ["pyrefly.toml"]),
+    command: ["pyrefly", "lsp"],
+    spawn: simpleSpawn("pyrefly", ["lsp"]),
   },
   {
     id: "pyright",
