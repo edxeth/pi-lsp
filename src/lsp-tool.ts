@@ -18,9 +18,9 @@
 
 import * as path from "node:path";
 import { Type, type Static } from "typebox";
-import { StringEnum } from "@mariozechner/pi-ai";
-import { keyHint, type ExtensionAPI, type ToolDefinition } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { keyHint, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import type { SignatureHelp, WorkspaceEdit, CodeAction, Command } from "vscode-languageserver-protocol";
 import { getOrCreateManager, shutdownManager, formatDiagnostic, filterDiagnosticsBySeverity, uriToPath, resolvePosition, type SeverityFilter } from "./lsp-core.js";
 import { formatBoundedDiagnostics, TOOL_DIAGNOSTIC_BUDGET } from "./diagnostic-output.js";

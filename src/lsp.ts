@@ -9,8 +9,8 @@
 
 import * as path from "node:path";
 import * as fs from "node:fs";
-import { type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Box, Text } from "@mariozechner/pi-tui";
+import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { type Diagnostic } from "vscode-languageserver-protocol";
 import { LSP_SERVERS, formatDiagnostic, getOrCreateManager, inspectLspForFile, shutdownManager, type LspInspection } from "./lsp-core.js";
 import { formatBoundedDiagnostics, HOOK_DIAGNOSTIC_BUDGET } from "./diagnostic-output.js";
