@@ -235,7 +235,7 @@ function formatWorkspaceEdit(edit: WorkspaceEdit, cwd?: string): string {
         const display = cwd && path.isAbsolute(fp) ? path.relative(cwd, fp) : fp;
         lines.push(`${display}:`);
         for (const e of change.edits || []) {
-          if ("range" in e) {
+          if ("newText" in e && "range" in e) {
             const loc = `${e.range.start.line + 1}:${e.range.start.character + 1}`;
             lines.push(`  [${loc}] → "${e.newText}"`);
           }
